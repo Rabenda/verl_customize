@@ -202,10 +202,12 @@ class vLLMHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
+        if not self.config.max_model_len:
+            self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
         self.rollout_mode = rollout_mode
         self.workers = workers
-
+        self.debug_count = 0
+        
         self.replica_rank = replica_rank
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
@@ -466,36 +468,41 @@ class vLLMHttpServer:
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
     ) -> TokenOutput:
-        """Generate sequence with token-in-token-out."""
-        # Calculate the maximum possible new tokens based on available context space
-        # This serves as a safety upper bound
-        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+        """针对 Workload 测试优化后的生成逻辑"""
+        
+        # 1. 第一步：先进行多模态 Token 去重（避免长度计算虚高）
+        # 如果是纯文本模型且没有对应的处理器，该函数通常会安全返回原数据
+        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        
+        # 2. 计算物理剩余空间
+        actual_prompt_len = len(prompt_ids)
+        max_possible_tokens = self.config.max_model_len - actual_prompt_len
+        
         if max_possible_tokens < 0:
             raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
+                f"Prompt length ({actual_prompt_len}) exceeds the model's maximum context length "
                 f"({self.config.max_model_len})."
             )
 
-        # Determine max_tokens from sampling_params or use configured response_length as default
+        # 3. 确定 max_tokens (新的生成长度预算)
         if "max_tokens" in sampling_params:
             max_tokens = sampling_params.pop("max_tokens")
         elif "max_new_tokens" in sampling_params:
-            # support sglang-style 'max_new_tokens' param
             max_tokens = sampling_params.pop("max_new_tokens")
         else:
-            # Default to a calculation that considers configured lengths
-            max_tokens = self.config.response_length + self.config.prompt_length - len(prompt_ids)
+            # 不再使用 (response_length + prompt_length - len) 这种会产生截断堆积的逻辑
+            # 尝试满足配置的 response_length，但不能超过物理极限
+            max_tokens = min(self.config.response_length, max_possible_tokens)
 
-        # Clamp max_tokens to the valid range [0, max_possible_tokens]
-        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+        # 确保 max_tokens 不为负数
+        max_tokens = max(0, max_tokens)
 
-        assert max_tokens <= max_possible_tokens, (
-            f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
-        )
+        # 4. 封装采样参数
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+
+        # 5. 准备 Prompt 数据
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -504,16 +511,17 @@ class vLLMHttpServer:
 
         prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
 
-        # Add lora request
+        # 6. 处理 LoRA 请求
         lora_request = None
         if self.model_config.lora_rank > 0:
-            # Make sure we also check that the lora is already loaded in the engine
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
             if lora_loaded:
                 lora_request = LoRARequest(
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
+        # 7. 调用 vLLM 引擎生成
+        print(f"DEBUG: sampling_params.n = {sampling_params.n}")
         generator = self.engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -521,14 +529,62 @@ class vLLMHttpServer:
             lora_request=lora_request,
             priority=priority,
         )
+        # print(f"prompt length: {len(prompt)} | token id: {len(token_ids)}")
+        # 8 * 512 prompt length, print output token length 
+        # 打印final_res.output 的structure
 
-        # Get final response
         final_res: Optional[RequestOutput] = None
         async for output in generator:
             final_res = output
         assert final_res is not None
 
+        # 8. 整理结果与日志打印
         token_ids = final_res.outputs[0].token_ids
+        finish_reason = final_res.outputs[0].finish_reason
+        # ========== dayin =================
+        # 1. 从 engine 或 model_config 中获取 tokenizer
+        # vLLM v1 通常可以通过 self.engine.get_tokenizer() 获取
+        # tokenizer = await self.engine.get_tokenizer()
+        
+        # # 2. 将 token_ids 解码为字符串
+        # decoded_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+        
+        # # 3. 打印输出
+        # print(f"DEBUG_DECODED_TEXT: {decoded_text}")
+        # 如果你想看具体的 token 列表（防止合并）
+        # decoded_tokens_list = [tokenizer.decode([tid]) for tid in token_ids]
+        # print(f"DEBUG_TOKEN_LIST: {decoded_tokens_list}")
+        
+        #======================================
+        # ========== 限制频率的调试打印 ==========
+        self.debug_count += 0
+        # 比如每 100 个 request 打印一次，或者每轮迭代的前 3 个打印
+        if self.replica_rank == 0 and self.debug_count % 100 == 0: 
+            try:
+                tokenizer = await self.engine.get_tokenizer()
+                decoded_prompt = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                
+                print(f"\n@@@ [DEBUG_GROUP_SAMPLE] Count: {self.debug_count} | Request_ID: {request_id} @@@")
+                print(f"PROMPT: {decoded_prompt.replace('\n', '\\n')[:500]}...") # 打印前500字
+                print(f"\n[final_res.outputs] Count: {len(final_res.outputs)}")
+                for i, output in enumerate(final_res.outputs):
+                    curr_text = tokenizer.decode(output.token_ids, skip_special_tokens=False)
+                    print(f"DECODING_{i}: {curr_text.replace('\n', '\\n')}")
+                
+                print(f"@@@ [DEBUG_GROUP_END] @@@\n", flush=True)
+            except Exception as e:
+                print(f"Debug print failed: {e}")
+        # =======================================
+        print(f"prompt length: {len(prompt_ids)} | generated tokens: {len(token_ids)}")
+        print(f"WORKLOAD_SAMPLE_LENGTH: {len(token_ids)} | STOP_REASON: {finish_reason}")
+        # import pprint
+        # print("-" * 20 + " vLLM Output Structure " + "-" * 20)
+        # # 打印第一个输出（通常 n=1）的所有属性
+        # for i, output in enumerate(final_res.outputs):
+        #     print(f"Output index: {i}")
+        #     pprint.pprint(vars(output))
+        # print("-" * 60)
+
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
@@ -537,14 +593,13 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
 
-        # Determine stop reason from finish_reason
-        finish_reason = final_res.outputs[0].finish_reason
+        # 确定停止状态
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
             stop_reason = "completed"
         else:
-            stop_reason = finish_reason  # for more stop reason in the future
+            stop_reason = finish_reason
 
         return TokenOutput(
             token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts, stop_reason=stop_reason

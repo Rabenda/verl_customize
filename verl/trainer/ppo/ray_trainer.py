@@ -1444,6 +1444,7 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
+                            # decoding
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
@@ -1489,6 +1490,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    print(f"OYHH_CHECK: Total sequences in this batch = {len(batch)}")
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1726,7 +1728,9 @@ class RayPPOTrainer:
 
                 progress_bar.update(1)
                 self.global_steps += 1
-
+                if self.global_steps > 5:
+                    print(f"OYHH_DEBUG: Reached 5 steps. Exiting.")
+                    import os; os._exit(0)
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
