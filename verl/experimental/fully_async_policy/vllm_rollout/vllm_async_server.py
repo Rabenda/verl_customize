@@ -33,7 +33,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
-@ray.remote(num_cpus=1)
 class vLLMHttpServerForPartial(vLLMHttpServer):
     def __init__(
         self,
@@ -45,8 +44,19 @@ class vLLMHttpServerForPartial(vLLMHttpServer):
         node_rank: int,
         gpus_per_node: int,
         nnodes: int,
+        cuda_visible_devices: str,
     ):
-        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
+        super().__init__(
+            config,
+            model_config,
+            rollout_mode,
+            workers,
+            replica_rank,
+            node_rank,
+            gpus_per_node,
+            nnodes,
+            cuda_visible_devices,
+        )
 
         # for cancel LLMServer
         self.paused = False
@@ -138,7 +148,7 @@ class FullyAsyncvLLMReplica(vLLMReplica):
         is_reward_model: bool = False,
     ):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
-        self.server_class = vLLMHttpServerForPartial
+        self.server_class = ray.remote(vLLMHttpServerForPartial)
 
     async def cancel(self):
         """Cancel each rollout server."""
