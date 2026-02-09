@@ -653,7 +653,7 @@ class DualRayPPOTrainer:
         tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
 
         batch_td = attach_global_token_num(batch_td)
-
+ 
         #debug
         # td = batch_td
         # print("[debug] keys:", list(td.keys()))
@@ -1265,8 +1265,7 @@ class DualRayPPOTrainer:
                             redundant_time=self.config.trainer.esi_redundant_time,
                         )
                         if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
+                            self.global_steps % self.config.trainer.save_freq == 0
                             or esi_close_to_expiration
                         ):
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
