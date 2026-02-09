@@ -30,6 +30,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed._tensor import DTensor
 
+from contextlib import nullcontext
+
 import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
@@ -676,8 +678,31 @@ class FSDPEngine(BaseEngine):
             )
         return per_tensor_param, peft_config
 
-    def disable_adapter(self) -> ContextManager:
-        return self.module.disable_adapter()
+    def disable_adapter(self):
+        m = self.module
+        try:
+            if hasattr(m, "disable_adapter"):
+                return m.disable_adapter()
+            if hasattr(m, "disable_adapters"):
+                return m.disable_adapters()
+        except ValueError as e:
+            if "No adapter loaded" in str(e):
+                return nullcontext()
+            raise
+        return nullcontext()
+
+    # def disable_adapter(self) -> ContextManager:
+
+    #     # self.module 可能是 FSDP；通过 getattr 会转发到 wrapped module
+    #     m = self.module
+
+    #     # 新/旧 API 兼容
+    #     if hasattr(m, "disable_adapter"):
+    #         return m.disable_adapter()
+    #     if hasattr(m, "disable_adapters"):
+    #         return m.disable_adapters()
+
+    #     return self.module.disable_adapter()
 
 
 class EngineEvalModeCtx(BaseEngineCtx):

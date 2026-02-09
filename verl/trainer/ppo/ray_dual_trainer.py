@@ -88,6 +88,87 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from typing import Dict, Optional
+import time
+from tensordict import NonTensorData
+
+def attach_global_token_num(td):
+    if "attention_mask" in td.keys():
+        # attention_mask: [B, T]，每行 sum 就是 token 数
+        token_num = td["attention_mask"].sum(dim=-1).to(torch.int).tolist()
+    else:
+        # fallback（需要你 pad_id 正确）
+        pad_id = 0
+        token_num = (td["input_ids"] != pad_id).sum(dim=-1).to(torch.int).tolist()
+
+    tu.assign_non_tensor(td, global_token_num=NonTensorData(token_num))
+    return td
+
+@dataclass
+class StepProfiler:
+    enabled: bool = True
+    verbose: bool = False                 # 是否每步/每rollout打印
+    print_every: int = 10                 # 每多少 step 打一次汇总
+    window: int = 50                      # 滑动窗口大小
+    print_rollout_each: bool = False      # 是否每次 rollout 都打印一次（会很吵）
+
+    _hist: Dict[str, deque] = field(default_factory=lambda: defaultdict(deque))
+    _sum: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    _cnt: int = 0
+
+    def update(self, timing_raw: Dict[str, float], step: int, prefix: str = ""):
+        if not self.enabled:
+            return
+        self._cnt += 1
+
+        # timing_raw 里通常是 {name: seconds}
+        for k, v in timing_raw.items():
+            if v is None:
+                continue
+            key = f"{prefix}{k}" if prefix else k
+            self._sum[key] += float(v)
+            dq = self._hist[key]
+            dq.append(float(v))
+            if len(dq) > self.window:
+                dq.popleft()
+
+        # 打印策略
+        if self.verbose and self.print_every > 0 and (step % self.print_every == 0):
+            print(self.format_report(step=step))
+
+    def mean(self, key: str) -> float:
+        dq = self._hist.get(key)
+        if not dq:
+            return 0.0
+        return sum(dq) / len(dq)
+
+    def total_mean(self, key: str) -> float:
+        if self._cnt == 0:
+            return 0.0
+        return self._sum.get(key, 0.0) / self._cnt
+
+    def format_report(self, step: int) -> str:
+        # 你关心的主路径：rollout(两边) + train(update actor/critic) + ref + reward 等
+        keys = [
+            "step",
+            "gen_a", "reward_a", "old_log_prob_a", "ref_log_prob_a", "values_a", "adv_a",
+            "gen_b", "reward_b", "old_log_prob_b", "ref_log_prob_b", "values_b", "adv_b",
+            "update_critic_a", "update_critic_b",
+            "update_actor_a", "update_actor_b",
+            "save_checkpoint", "update_weights_a", "update_weights_b",
+            "testing",
+        ]
+
+        # 只打印出现过的 key
+        present = [k for k in keys if k in self._hist]
+
+        # 一行：滑动均值（window）+ 总均值
+        parts = [f"[profile] step={step} window={self.window}"]
+        for k in present:
+            parts.append(f"{k}: {self.mean(k)*1000:.1f}ms (avg), {self.total_mean(k)*1000:.1f}ms (all)")
+        return " | ".join(parts)
 
 # -------------------------
 # Small shared helpers
@@ -570,14 +651,23 @@ class DualRayPPOTrainer:
         batch_td = batch.to_tensordict()
         batch_td = left_right_2_no_padding(batch_td)
         tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+
+        batch_td = attach_global_token_num(batch_td)
+
+        #debug
+        # td = batch_td
+        # print("[debug] keys:", list(td.keys()))
+        # print("[debug] has global_token_num?", "global_token_num" in td.keys())
+        # print("[debug] non_tensor keys:", list(tu.get_non_tensor(td).keys()) if hasattr(tu, "get_non_tensor") else "n/a")
+
         output = actor_wg.compute_log_prob(batch_td)
         entropy = tu.get(output, "entropy")
         log_probs = tu.get(output, "log_probs")
-        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+        # old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
         # metrics = output.get("metrics", {}) or {}
         # old_log_prob_mfu = float(metrics.get("mfu", 0.0))
-        # metrics = tu.get(output, "metrics", default={})
-        # old_log_prob_mfu = metrics.get("mfu", None)
+        metrics = tu.get(output, "metrics", default={})
+        old_log_prob_mfu = metrics.get("mfu", None)
         entropy = no_padding_2_padding(entropy, batch_td)
         log_probs = no_padding_2_padding(log_probs, batch_td)
         old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
@@ -615,6 +705,8 @@ class DualRayPPOTrainer:
 
         batch_td = batch.to_tensordict()
         batch_td = left_right_2_no_padding(batch_td)
+
+        # print(f"[debug][ppo_loss] missing ref_log_prob. keys={list(batch_td.keys())}")
 
         calculate_entropy = actor_cfg.actor.entropy_coeff != 0.0
         ppo_mini_batch_size = actor_cfg.actor.ppo_mini_batch_size * actor_cfg.rollout.n
@@ -1062,6 +1154,27 @@ class DualRayPPOTrainer:
                 config=self.config.algorithm,
             )
 
+        # 在 _step_one_actor 末尾 return 前加：
+        if getattr(self, "profiler", None) is not None and self.profiler.enabled:
+            if self.profiler.verbose and self.profiler.print_rollout_each:
+                print(f"Rollout for {which} successfully finished")
+                # 只打印该 actor 本次 rollout 的关键段
+                keys = [f"gen_{which}", f"reward_{which}", f"old_log_prob_{which}",
+                        f"ref_log_prob_{which}", f"values_{which}", f"adv_{which}"]
+                msg = [f"[rollout-profile] which={which} global_step={self.global_steps}"]
+                for k in keys:
+                    if k in timing_raw:
+                        msg.append(f"{k}={timing_raw[k]*1000:.1f}ms")
+                print(" | ".join(msg))
+
+        # ensure global_token_num exists for throughput metrics
+        if "global_token_num" not in batch.meta_info:
+            if "attention_mask" in batch.batch:
+                batch.meta_info["global_token_num"] = batch.batch["attention_mask"].sum(dim=-1).to(torch.int).tolist()
+            else:
+                pad_id = self.tokenizer.pad_token_id or 0
+                batch.meta_info["global_token_num"] = (batch.batch["input_ids"] != pad_id).sum(dim=-1).to(torch.int).tolist()
+
         return batch, reward_extra_infos_dict
 
     # -------------------------
@@ -1097,6 +1210,16 @@ class DualRayPPOTrainer:
             logger.log(data=val_b, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
+
+        # 从 config 里读（你也可以放 trainer.profile.*）
+        prof_cfg = self.config.trainer.get("profile", {})
+        self.profiler = StepProfiler(
+            enabled=prof_cfg.get("enabled", False),
+            verbose=prof_cfg.get("verbose", False),
+            print_every=prof_cfg.get("print_every", 10),
+            window=prof_cfg.get("window", 50),
+            print_rollout_each=prof_cfg.get("print_rollout_each", False),
+        )
 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Dual Training Progress")
 
@@ -1191,3 +1314,6 @@ class DualRayPPOTrainer:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
+
+                if getattr(self, "profiler", None) is not None:
+                    self.profiler.update(timing_raw=timing_raw, step=self.global_steps)

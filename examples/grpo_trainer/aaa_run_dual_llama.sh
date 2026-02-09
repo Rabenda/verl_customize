@@ -13,8 +13,8 @@ python3 -m verl.trainer.main_ppo_stone \
   data.filter_overlong_prompts=True \
   data.truncation='error' \
   \
-  +actor_rollout_ref_a.model.path=Qwen/Qwen3-0.6B \
-  +actor_rollout_ref_b.model.path=Qwen/Qwen3-0.6B \
+  +actor_rollout_ref_a.model.path=meta-llama/Llama-3.1-8B-Instruct \
+  +actor_rollout_ref_b.model.path=meta-llama/Llama-3.1-8B-Instruct \
   \
   +actor_rollout_ref_a.actor.optim.lr=1e-6 \
   +actor_rollout_ref_b.actor.optim.lr=1e-6 \
@@ -40,8 +40,8 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.actor.entropy_coeff=0 \
   +actor_rollout_ref_b.actor.entropy_coeff=0 \
   \
-  +actor_rollout_ref_a.model.enable_gradient_checkpointing=False \
-  +actor_rollout_ref_b.model.enable_gradient_checkpointing=False \
+  +actor_rollout_ref_a.model.enable_gradient_checkpointing=True \
+  +actor_rollout_ref_b.model.enable_gradient_checkpointing=True \
   \
   +actor_rollout_ref_a.actor.fsdp_config.param_offload=True \
   +actor_rollout_ref_b.actor.fsdp_config.param_offload=True \
@@ -52,14 +52,14 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.rollout.log_prob_micro_batch_size_per_gpu=32 \
   +actor_rollout_ref_b.rollout.log_prob_micro_batch_size_per_gpu=32 \
   \
-  +actor_rollout_ref_a.rollout.tensor_model_parallel_size=2 \
-  +actor_rollout_ref_b.rollout.tensor_model_parallel_size=2 \
+  +actor_rollout_ref_a.rollout.tensor_model_parallel_size=4 \
+  +actor_rollout_ref_b.rollout.tensor_model_parallel_size=4 \
   \
   +actor_rollout_ref_a.rollout.name=vllm \
   +actor_rollout_ref_b.rollout.name=vllm \
   \
-  +actor_rollout_ref_a.rollout.gpu_memory_utilization=0.2 \
-  +actor_rollout_ref_b.rollout.gpu_memory_utilization=0.2 \
+  +actor_rollout_ref_a.rollout.gpu_memory_utilization=0.45 \
+  +actor_rollout_ref_b.rollout.gpu_memory_utilization=0.45 \
   \
   +actor_rollout_ref_a.rollout.n=5 \
   +actor_rollout_ref_b.rollout.n=5 \
@@ -70,19 +70,14 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.ref.fsdp_config.param_offload=True \
   +actor_rollout_ref_b.ref.fsdp_config.param_offload=True \
   \
-  +actor_rollout_ref_a.rollout.server_name_suffix=a \
-  +actor_rollout_ref_b.rollout.server_name_suffix=b \
-  \
-  algorithm.use_kl_in_reward=True \
+  algorithm.use_kl_in_reward=False \
   trainer.critic_warmup=0 \
   trainer.logger='["console"]' \
   trainer.project_name='verl_grpo_example_gsm8k' \
   trainer.experiment_name='qwen3_8b_function_rm' \
-  trainer.n_gpus_per_node=2 \
+  trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
-  trainer.save_freq=5 \
+  trainer.save_freq=1 \
   trainer.test_freq=5 \
   trainer.total_epochs=1 \
-  trainer.total_training_steps=1 \
-  trainer.balance_batch=false \
   "$@"
