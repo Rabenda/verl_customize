@@ -131,7 +131,10 @@ class ServerAdapter(BaseRollout):
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            # self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            suffix = getattr(self.config, "server_name_suffix", None) or "default"
+            name = f"vllm_server_{self.replica_rank}_{self.node_rank}_{suffix}"
+            self.server_handle = ray.get_actor(name)
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future

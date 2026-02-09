@@ -510,7 +510,7 @@ class vLLMHttpServer:
                 )
 
         # 7. 调用 vLLM 引擎生成
-        print(f"DEBUG: sampling_params.n = {sampling_params.n}")
+        # print(f"DEBUG: sampling_params.n = {sampling_params.n}")
         generator = self.engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -548,24 +548,24 @@ class vLLMHttpServer:
         # ========== 限制频率的调试打印 ==========
         self.debug_count += 0
         # 比如每 100 个 request 打印一次，或者每轮迭代的前 3 个打印
-        if self.replica_rank == 0 and self.debug_count % 100 == 0: 
-            try:
-                tokenizer = await self.engine.get_tokenizer()
-                decoded_prompt = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+        # if self.replica_rank == 0 and self.debug_count % 100 == 0: 
+        #     try:
+        #         tokenizer = await self.engine.get_tokenizer()
+        #         decoded_prompt = tokenizer.decode(prompt_ids, skip_special_tokens=False)
                 
-                print(f"\n@@@ [DEBUG_GROUP_SAMPLE] Count: {self.debug_count} | Request_ID: {request_id} @@@")
-                print(f"PROMPT: {decoded_prompt.replace('\n', '\\n')[:500]}...") # 打印前500字
-                print(f"\n[final_res.outputs] Count: {len(final_res.outputs)}")
-                for i, output in enumerate(final_res.outputs):
-                    curr_text = tokenizer.decode(output.token_ids, skip_special_tokens=False)
-                    print(f"DECODING_{i}: {curr_text.replace('\n', '\\n')}")
+        #         print(f"\n@@@ [DEBUG_GROUP_SAMPLE] Count: {self.debug_count} | Request_ID: {request_id} @@@")
+        #         print(f"PROMPT: {decoded_prompt.replace('\n', '\\n')[:500]}...") # 打印前500字
+        #         print(f"\n[final_res.outputs] Count: {len(final_res.outputs)}")
+        #         for i, output in enumerate(final_res.outputs):
+        #             curr_text = tokenizer.decode(output.token_ids, skip_special_tokens=False)
+        #             print(f"DECODING_{i}: {curr_text.replace('\n', '\\n')}")
                 
-                print(f"@@@ [DEBUG_GROUP_END] @@@\n", flush=True)
-            except Exception as e:
-                print(f"Debug print failed: {e}")
-        # =======================================
-        print(f"prompt length: {len(prompt_ids)} | generated tokens: {len(token_ids)}")
-        print(f"WORKLOAD_SAMPLE_LENGTH: {len(token_ids)} | STOP_REASON: {finish_reason}")
+        #         print(f"@@@ [DEBUG_GROUP_END] @@@\n", flush=True)
+        #     except Exception as e:
+        #         print(f"Debug print failed: {e}")
+        # # =======================================
+        # print(f"prompt length: {len(prompt_ids)} | generated tokens: {len(token_ids)}")
+        # print(f"WORKLOAD_SAMPLE_LENGTH: {len(token_ids)} | STOP_REASON: {finish_reason}")
         # import pprint
         # print("-" * 20 + " vLLM Output Structure " + "-" * 20)
         # # 打印第一个输出（通常 n=1）的所有属性
@@ -589,6 +589,11 @@ class vLLMHttpServer:
             stop_reason = "completed"
         else:
             stop_reason = finish_reason
+
+
+        num_preempted = 0
+        if hasattr(final_res, "preempted"):
+            num_preempted = final_res.preempted
 
         return TokenOutput(
             token_ids=token_ids,
@@ -795,11 +800,20 @@ class vLLMReplica(RolloutReplica):
                 worker_cuda_visible_devices[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
             )
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
+            # name = (
+            #     f"vllm_server_{self.replica_rank}_{node_rank}"
+            #     if not self.is_reward_model
+            #     else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
+            # )
+            # Prefix to avoid name collisions across multiple AgentLoopManagers (e.g., dual-model A/B)
+            suffix = getattr(self.config, "server_name_suffix", None) or "default"
+
             name = (
-                f"vllm_server_{self.replica_rank}_{node_rank}"
+                f"vllm_server_{self.replica_rank}_{node_rank}_{suffix}"
                 if not self.is_reward_model
-                else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
+                else f"vllm_server_reward_{self.replica_rank}_{node_rank}_{suffix}"
             )
+
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,

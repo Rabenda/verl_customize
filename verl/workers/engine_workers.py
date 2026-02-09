@@ -389,6 +389,52 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     NOTE: ActorRolloutRefWorker no longer support spmd mode and run native server mode.
     """
 
+    def _which_ab(self) -> str | None:
+        r = (self.role or "").lower()
+        if r.endswith("_a"):
+            return "a"
+        if r.endswith("_b"):
+            return "b"
+        return None
+
+    def _sanitize_dual_model_cfg_inplace(self):
+        which = self._which_ab()
+        if which is None:
+            with open_dict(self.config):
+                if "model" in self.config:
+                    if "path_a" in self.config.model:
+                        self.config.model.pop("path_a")
+                    if "path_b" in self.config.model:
+                        self.config.model.pop("path_b")
+                if "rollout" in self.config:
+                    if "n_a" in self.config.rollout:
+                        self.config.rollout.pop("n_a")
+                    if "n_b" in self.config.rollout:
+                        self.config.rollout.pop("n_b")
+            return
+
+        # dual: set path/n then pop extra keys
+        with open_dict(self.config):
+            # model.path
+            if "model" in self.config:
+                key = f"path_{which}"
+                if key in self.config.model:
+                    self.config.model.path = self.config.model[key]
+                if "path_a" in self.config.model:
+                    self.config.model.pop("path_a")
+                if "path_b" in self.config.model:
+                    self.config.model.pop("path_b")
+
+            # rollout.n
+            if "rollout" in self.config:
+                key = f"n_{which}"
+                if key in self.config.rollout:
+                    self.config.rollout.n = self.config.rollout[key]
+                if "n_a" in self.config.rollout:
+                    self.config.rollout.pop("n_a")
+                if "n_b" in self.config.rollout:
+                    self.config.rollout.pop("n_b")
+
     def __init__(self, config: DictConfig, role: str, **kwargs):
         Worker.__init__(self)
         self.config = config
@@ -396,10 +442,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor: TrainingWorker = None
         self.ref: TrainingWorker = None
         self.rollout: BaseRollout = None
-        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
-        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
-        self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        # assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
+        # self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
+        # self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
+        # self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        # We are using two actor models now
+        # print("self.role", self.role)
+        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref", \
+                     "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"]
+        self._is_actor   = self.role in ["actor", "actor_rollout", "actor_rollout_ref", \
+                                        "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"]
+        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref", \
+                                        "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"]
+        self._is_ref     = self.role in ["ref", "actor_rollout_ref", \
+                                        "actor_rollout_ref_a", "actor_rollout_ref_b"]
 
         if self._is_actor:
             omega_profiler_config = config.actor.get("profiler", {})
@@ -433,6 +489,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # which = self._which_ab()
+        # if which is not None:
+        #     key = f"path_{which}"
+        #     with open_dict(self.config.model):
+        #         if key in self.config.model:
+        #             # map to canonical field
+        #             self.config.model.path = self.config.model[key]
+        #         # IMPORTANT: remove extra keys so HFModelConfig instantiate won't crash
+        #         if "path_a" in self.config.model:
+        #             self.config.model.pop("path_a")
+        #         if "path_b" in self.config.model:
+        #             self.config.model.pop("path_b")
+        self._sanitize_dual_model_cfg_inplace()
+
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model

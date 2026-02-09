@@ -18,7 +18,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from packaging import version
-from torch.distributed.tensor import DTensor
+from torch.distributed._tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 
 if version.parse(torch.__version__) < version.parse("2.6"):

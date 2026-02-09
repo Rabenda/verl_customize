@@ -122,6 +122,9 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # Whether to train two models simultaneously
+  dual_model: False
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
@@ -209,7 +212,7 @@ trainer:
 
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
-  use_legacy_worker_impl: auto
+  use_legacy_worker_impl: disable
 
 # profiler configs
 global_profiler:

@@ -167,6 +167,9 @@ class RolloutConfig(BaseConfig):
     logprobs_mode: Optional[str] = "processed_logprobs"
     scheduling_policy: Optional[str] = "fcfs"
 
+    # For dual model serving
+    server_name_suffix: Optional[str] = None
+
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
 

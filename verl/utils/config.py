@@ -83,30 +83,60 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    from omegaconf import OmegaConf
+
+    def _select(key: str, default=None):
+        # Safe select for DictConfig with struct=True (missing keys won't raise)
+        try:
+            v = OmegaConf.select(config, key)
+            return default if v is None else v
+        except Exception:
+            return default
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
-    if not config.actor_rollout_ref.actor.use_dynamic_bsz:
-        if config.actor_rollout_ref.actor.strategy == "megatron":
-            model_parallel_size = (
-                config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size
-                * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
-            )
-            assert (
-                n_gpus % (model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size) == 0
-            ), (
+    # ---- robust dynamic_bsz gate ----
+    # Some schemas do NOT have actor.use_dynamic_bsz; treat missing as False.
+    use_dynamic_bsz = _select("actor_rollout_ref.actor.use_dynamic_bsz", False)
+
+    if not use_dynamic_bsz:
+        actor_strategy = _select("actor_rollout_ref.actor.strategy", None)
+
+        if actor_strategy == "megatron":
+            tmp = _select("actor_rollout_ref.actor.megatron.tensor_model_parallel_size", 1)
+            pmp = _select("actor_rollout_ref.actor.megatron.pipeline_model_parallel_size", 1)
+            cpp = _select("actor_rollout_ref.actor.megatron.context_parallel_size", 1)
+
+            model_parallel_size = tmp * pmp
+            assert n_gpus % (model_parallel_size * cpp) == 0, (
                 f"n_gpus ({n_gpus}) must be divisible by model_parallel_size ({model_parallel_size}) times "
-                f"context_parallel_size ({config.actor_rollout_ref.actor.megatron.context_parallel_size})"
+                f"context_parallel_size ({cpp})"
             )
-            megatron_dp = n_gpus // (
-                model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size
+            megatron_dp = n_gpus // (model_parallel_size * cpp)
+
+            # In old/new configs, either ppo_micro_batch_size_per_gpu OR ppo_micro_batch_size exists.
+            ppo_micro_per_gpu = _select("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu", None)
+            ppo_micro = _select("actor_rollout_ref.actor.ppo_micro_batch_size", None)
+
+            assert not (ppo_micro_per_gpu is None and ppo_micro is None), (
+                "[actor] Please set at least one of 'actor.ppo_micro_batch_size' or "
+                "'actor.ppo_micro_batch_size_per_gpu' if use_dynamic_bsz is not enabled."
             )
-            minimal_bsz = megatron_dp * config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+
+            # If only global micro batch is given, convert to per-gpu micro batch for minimal_bsz check.
+            if ppo_micro_per_gpu is None:
+                # best-effort: interpret ppo_micro as global micro-batch across DP
+                # (this is conservative; if you use a different convention, set *_per_gpu explicitly)
+                ppo_micro_per_gpu = max(int(ppo_micro) // max(int(megatron_dp), 1), 1)
+
+            minimal_bsz = megatron_dp * int(ppo_micro_per_gpu)
         else:
             minimal_bsz = n_gpus
 
         # 1. Check total batch size for data correctness
-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+        rollout_n = _select("actor_rollout_ref.rollout.n", 1)
+        real_train_batch_size = config.data.train_batch_size * int(rollout_n)
         assert real_train_batch_size % minimal_bsz == 0, (
             f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
             f"({minimal_bsz})"

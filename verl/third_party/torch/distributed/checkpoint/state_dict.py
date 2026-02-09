@@ -120,7 +120,7 @@ from torch.distributed.fsdp._common_utils import (
     FSDP_WRAPPED_MODULE,
     _get_module_fsdp_state_if_fully_sharded_module,
 )
-from torch.distributed.tensor import DTensor
+from torch.distributed._tensor import DTensor
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils._pytree import tree_map_only

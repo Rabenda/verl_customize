@@ -23,7 +23,7 @@ from torch.distributed._tensor import Placement, Shard
 
 try:
     # for torch 2.5+
-    from torch.distributed.tensor import DTensor
+    from torch.distributed._tensor import DTensor
 except ImportError:
     from torch.distributed._tensor import DTensor
 

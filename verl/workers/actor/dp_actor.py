@@ -23,7 +23,7 @@ import os
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.tensor import DTensor
+from torch.distributed._tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
