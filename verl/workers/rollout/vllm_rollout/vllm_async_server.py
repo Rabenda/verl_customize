@@ -54,6 +54,10 @@ from verl.workers.rollout.vllm_rollout.utils import (
     get_vllm_max_lora_rank,
 )
 
+from uuid import uuid4
+import heapq
+import time
+
 _VLLM_VERSION = version.parse(vllm.__version__)
 
 if _VLLM_VERSION > version.parse("0.11.0"):
@@ -117,6 +121,11 @@ class vLLMHttpServer:
         self.rollout_mode = rollout_mode
         self.workers = workers
         self.debug_count = 0
+
+        # ===== streaming state (server-side) =====
+        self._stream_queues: dict[str, asyncio.Queue] = {}
+        self._stream_tasks: dict[str, asyncio.Task] = {}
+        self._stream_meta: dict[str, dict] = {}
         
         self.replica_rank = replica_rank
         self.node_rank = node_rank
@@ -183,12 +192,34 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        await self.engine.collective_rpc(
+        return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
             kwargs=kwargs,
         )
+
+    async def poll_generate_stream_many(self, handles, timeout_ms: int = 5):
+        # timeout_ms: apply to the *whole* poll call, not per-handle
+        timeout_s = max(0.0, float(timeout_ms) / 1000.0)
+
+        async def _poll_one(h, t):
+            msg = await self.poll_generate_stream(h, timeout_s=t)
+            return (h, msg)
+
+        # 给第一个 handle 一个 timeout，其它 handle 0 timeout（避免 N 倍等待）
+        tasks = []
+        for i, h in enumerate(handles):
+            tasks.append(_poll_one(h, timeout_s if i == 0 else 0.0))
+
+        out = await asyncio.gather(*tasks, return_exceptions=False)
+
+        # 只返回有消息的，减少上层处理
+        results = []
+        for h, msg in out:
+            if msg is not None:
+                results.append({"handle": h, **msg})
+        return results
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -518,6 +549,14 @@ class vLLMHttpServer:
             lora_request=lora_request,
             priority=priority,
         )
+
+        # i = 0
+        # async for output in generator:
+        #     i += 1
+        #     if i <= 3:
+        #         print(f"[dbg] yield #{i} request_id={request_id} out_len={len(output.outputs[0].token_ids)}", flush=True)
+        #     final_res = output
+
         # print(f"prompt length: {len(prompt)} | token id: {len(token_ids)}")
         # 8 * 512 prompt length, print output token length 
         # 打印final_res.output 的structure
@@ -738,6 +777,190 @@ class vLLMHttpServer:
             logger.error(f"Error aborting request {request_id}: {e}")
             return {"aborted": False, "request_id": request_id, "error": str(e)}
 
+    # =========================
+    # Streaming RPC (single-handle)
+    # =========================
+    async def start_generate_stream(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+
+        actual_prompt_len = len(prompt_ids)
+        max_possible_tokens = self.config.max_model_len - actual_prompt_len
+        if max_possible_tokens < 0:
+            raise ValueError(
+                f"Prompt length ({actual_prompt_len}) exceeds max_model_len ({self.config.max_model_len})."
+            )
+
+        sp = dict(sampling_params)  # do not mutate caller
+        if "max_tokens" in sp:
+            max_tokens = sp.pop("max_tokens")
+        elif "max_new_tokens" in sp:
+            max_tokens = sp.pop("max_new_tokens")
+        else:
+            max_tokens = min(self.config.response_length, max_possible_tokens)
+        max_tokens = max(0, max_tokens)
+
+        sp["logprobs"] = 0 if sp.pop("logprobs", False) else None
+        sp.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling = SamplingParams(max_tokens=max_tokens, **sp)
+
+        multi_modal_data = {}
+        if image_data is not None:
+            multi_modal_data["image"] = image_data
+        if video_data is not None:
+            multi_modal_data["video"] = video_data
+        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+
+        lora_request = None
+        if self.model_config.lora_rank > 0:
+            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            if lora_loaded:
+                lora_request = LoRARequest(
+                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                )
+
+        handle = uuid4().hex
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)  # backpressure
+        self._stream_queues[handle] = q
+        self._stream_meta[handle] = {
+            "request_id": request_id,
+            "done": False,
+            "finish_reason": None,
+            "stop_reason": None,
+            "num_preempted": 0,
+            "total_tokens": 0,
+        }
+
+        async def _runner():
+            prev_len = 0
+            final_out: Optional[RequestOutput] = None
+            try:
+                gen = self.engine.generate(
+                    prompt=prompt,
+                    sampling_params=sampling,
+                    request_id=request_id,
+                    lora_request=lora_request,
+                    priority=priority,
+                )
+
+                async for out in gen:
+                    final_out = out
+                    token_ids = out.outputs[0].token_ids
+                    cur_len = len(token_ids)
+                    if cur_len > prev_len:
+                        delta = token_ids[prev_len:cur_len]
+                        prev_len = cur_len
+                        await q.put({"type": "delta", "token_ids": delta, "total_tokens": cur_len})
+
+                if final_out is None:
+                    self._stream_meta[handle].update(
+                        {"done": True, "finish_reason": "abort", "stop_reason": "aborted", "total_tokens": prev_len}
+                    )
+                    await q.put({"type": "done", "finish_reason": "abort", "stop_reason": "aborted"})
+                    return
+
+                finish_reason = final_out.outputs[0].finish_reason
+                if finish_reason == "abort":
+                    stop_reason = "aborted"
+                elif finish_reason in ("stop", "length"):
+                    stop_reason = "completed"
+                else:
+                    stop_reason = finish_reason
+
+                num_preempted = 0
+                if hasattr(final_out, "preempted"):
+                    num_preempted = final_out.preempted
+
+                self._stream_meta[handle].update(
+                    {
+                        "done": True,
+                        "finish_reason": finish_reason,
+                        "stop_reason": stop_reason,
+                        "num_preempted": num_preempted,
+                        "total_tokens": prev_len,
+                    }
+                )
+                await q.put(
+                    {
+                        "type": "done",
+                        "finish_reason": finish_reason,
+                        "stop_reason": stop_reason,
+                        "num_preempted": num_preempted,
+                        "total_tokens": prev_len,
+                    }
+                )
+
+            except Exception as e:
+                self._stream_meta[handle].update(
+                    {"done": True, "finish_reason": "error", "stop_reason": "error", "total_tokens": prev_len}
+                )
+                await q.put({"type": "error", "error": str(e)})
+
+        self._stream_tasks[handle] = asyncio.create_task(_runner())
+
+        return {
+            "handle": handle,
+            "request_id": request_id,
+            "prompt_len": actual_prompt_len,
+            "max_tokens": max_tokens,
+        }
+
+    async def poll_generate_stream(self, handle: str, timeout_s: float = 0.0) -> Optional[dict[str, Any]]:
+        q = self._stream_queues.get(handle)
+        if q is None:
+            return {"type": "error", "error": f"unknown handle {handle}"}
+
+        try:
+            if timeout_s and timeout_s > 0:
+                return await asyncio.wait_for(q.get(), timeout=timeout_s)
+            return q.get_nowait()
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.QueueEmpty:
+            return None
+
+    async def finalize_generate_stream(self, handle: str) -> dict[str, Any]:
+        t = self._stream_tasks.get(handle)
+        if t is None:
+            return {"ok": False, "error": f"unknown handle {handle}"}
+        try:
+            await t
+        except Exception:
+            pass
+        meta = self._stream_meta.get(handle, {})
+        return {"ok": True, **meta}
+
+    async def cancel_generate_stream(self, handle: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        meta = self._stream_meta.get(handle)
+        if meta is None:
+            return {"ok": False, "error": f"unknown handle {handle}"}
+
+        req_id = meta.get("request_id")
+        if req_id is not None:
+            await self.abort_request(req_id, reset_prefix_cache=reset_prefix_cache)
+
+        t = self._stream_tasks.get(handle)
+        if t is not None and not t.done():
+            t.cancel()
+
+        self._stream_meta[handle].update({"done": True, "finish_reason": "cancel", "stop_reason": "cancel"})
+
+        q = self._stream_queues.get(handle)
+        if q is not None:
+            try:
+                await q.put({"type": "done", "finish_reason": "cancel", "stop_reason": "cancel"})
+            except Exception:
+                pass
+
+        return {"ok": True, "handle": handle}
+
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
 
@@ -819,7 +1042,12 @@ class vLLMReplica(RolloutReplica):
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
+                runtime_env={"env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "CUDA_MPS_PIPE_DIRECTORY": "/tmp/nvidia-mps",
+                    "CUDA_MPS_LOG_DIRECTORY": "/tmp/nvidia-mps-log",
+                    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "50"
+                }},
                 name=name,
             ).remote(
                 config=self.config,
@@ -896,6 +1124,191 @@ class vLLMReplica(RolloutReplica):
                 return r
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
+
+    async def start_generate_stream(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        """
+        Start a streaming generation and return a handle immediately.
+        Poll by poll_generate_stream(handle).
+        """
+        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+
+        actual_prompt_len = len(prompt_ids)
+        max_possible_tokens = self.config.max_model_len - actual_prompt_len
+        if max_possible_tokens < 0:
+            raise ValueError(
+                f"Prompt length ({actual_prompt_len}) exceeds max_model_len ({self.config.max_model_len})."
+            )
+
+        sp = dict(sampling_params)  # do not mutate caller
+        if "max_tokens" in sp:
+            max_tokens = sp.pop("max_tokens")
+        elif "max_new_tokens" in sp:
+            max_tokens = sp.pop("max_new_tokens")
+        else:
+            max_tokens = min(self.config.response_length, max_possible_tokens)
+        max_tokens = max(0, max_tokens)
+
+        sp["logprobs"] = 0 if sp.pop("logprobs", False) else None
+        sp.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling = SamplingParams(max_tokens=max_tokens, **sp)
+
+        multi_modal_data = {}
+        if image_data is not None:
+            multi_modal_data["image"] = image_data
+        if video_data is not None:
+            multi_modal_data["video"] = video_data
+        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+
+        lora_request = None
+        if self.model_config.lora_rank > 0:
+            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            if lora_loaded:
+                lora_request = LoRARequest(
+                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                )
+
+        handle = uuid4().hex
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)  # backpressure
+        self._stream_queues[handle] = q
+        self._stream_meta[handle] = {
+            "request_id": request_id,
+            "done": False,
+            "finish_reason": None,
+            "stop_reason": None,
+            "num_preempted": 0,
+            "total_tokens": 0,
+        }
+
+        async def _runner():
+            prev_len = 0
+            final_out: Optional[RequestOutput] = None
+            try:
+                gen = self.engine.generate(
+                    prompt=prompt,
+                    sampling_params=sampling,
+                    request_id=request_id,
+                    lora_request=lora_request,
+                    priority=priority,
+                )
+
+                async for out in gen:
+                    final_out = out
+                    token_ids = out.outputs[0].token_ids
+                    cur_len = len(token_ids)
+                    if cur_len > prev_len:
+                        delta = token_ids[prev_len:cur_len]
+                        prev_len = cur_len
+                        await q.put({"type": "delta", "token_ids": delta, "total_tokens": cur_len})
+
+                if final_out is None:
+                    self._stream_meta[handle].update(
+                        {"done": True, "finish_reason": "abort", "stop_reason": "aborted", "total_tokens": prev_len}
+                    )
+                    await q.put({"type": "done", "finish_reason": "abort", "stop_reason": "aborted"})
+                    return
+
+                finish_reason = final_out.outputs[0].finish_reason
+                if finish_reason == "abort":
+                    stop_reason = "aborted"
+                elif finish_reason in ("stop", "length"):
+                    stop_reason = "completed"
+                else:
+                    stop_reason = finish_reason
+
+                num_preempted = 0
+                if hasattr(final_out, "preempted"):
+                    num_preempted = final_out.preempted
+
+                self._stream_meta[handle].update(
+                    {
+                        "done": True,
+                        "finish_reason": finish_reason,
+                        "stop_reason": stop_reason,
+                        "num_preempted": num_preempted,
+                        "total_tokens": prev_len,
+                    }
+                )
+                await q.put(
+                    {
+                        "type": "done",
+                        "finish_reason": finish_reason,
+                        "stop_reason": stop_reason,
+                        "num_preempted": num_preempted,
+                        "total_tokens": prev_len,
+                    }
+                )
+
+            except Exception as e:
+                self._stream_meta[handle].update(
+                    {"done": True, "finish_reason": "error", "stop_reason": "error", "total_tokens": prev_len}
+                )
+                await q.put({"type": "error", "error": str(e)})
+
+        self._stream_tasks[handle] = asyncio.create_task(_runner())
+
+        return {
+            "handle": handle,
+            "request_id": request_id,
+            "prompt_len": actual_prompt_len,
+            "max_tokens": max_tokens,
+        }
+
+    async def poll_generate_stream(self, handle: str, timeout_s: float = 0.0) -> Optional[dict[str, Any]]:
+        q = self._stream_queues.get(handle)
+        if q is None:
+            return {"type": "error", "error": f"unknown handle {handle}"}
+
+        try:
+            if timeout_s and timeout_s > 0:
+                return await asyncio.wait_for(q.get(), timeout=timeout_s)
+            return q.get_nowait()
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.QueueEmpty:
+            return None
+
+    async def finalize_generate_stream(self, handle: str) -> dict[str, Any]:
+        t = self._stream_tasks.get(handle)
+        if t is None:
+            return {"ok": False, "error": f"unknown handle {handle}"}
+        try:
+            await t
+        except Exception:
+            pass
+        meta = self._stream_meta.get(handle, {})
+        return {"ok": True, **meta}
+
+    async def cancel_generate_stream(self, handle: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        meta = self._stream_meta.get(handle)
+        if meta is None:
+            return {"ok": False, "error": f"unknown handle {handle}"}
+
+        req_id = meta.get("request_id")
+        if req_id is not None:
+            await self.abort_request(req_id, reset_prefix_cache=reset_prefix_cache)
+
+        t = self._stream_tasks.get(handle)
+        if t is not None and not t.done():
+            t.cancel()
+
+        self._stream_meta[handle].update({"done": True, "finish_reason": "cancel", "stop_reason": "cancel"})
+
+        q = self._stream_queues.get(handle)
+        if q is not None:
+            try:
+                await q.put({"type": "done", "finish_reason": "cancel", "stop_reason": "cancel"})
+            except Exception:
+                pass
+
+        return {"ok": True, "handle": handle}
 
 
 def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):

@@ -49,6 +49,13 @@ from verl.utils.rollout_trace import (
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
+import time
+from dataclasses import dataclass, field
+
+from typing import AsyncIterator, List, Dict, Any, Optional
+
+import traceback
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -79,6 +86,18 @@ class AsyncLLMServerManager:
         # LRU cache to map request_id to server
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
+        # ===== scheduler =====
+        # per-server inflight limiter
+        self.max_inflight_per_server = int(getattr(config.actor_rollout_ref.rollout, "max_inflight_per_server", 8))
+        self._inflight = {id(s): 0 for s in self.server_handles}
+
+        # global priority queue for pending stream starts
+        self._sched_lock = asyncio.Lock()
+        self._sched_cv = asyncio.Condition(self._sched_lock)
+        self._pending = []  # heap of _SchedItem
+        self._seq = 0
+        self._sched_task = asyncio.create_task(self._scheduler_loop())
+
     def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
         # TODO: implement server pressure awareness load balancing
         if request_id in self.request_id_to_server:
@@ -89,6 +108,67 @@ class AsyncLLMServerManager:
         heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
         self.request_id_to_server[request_id] = server
         return server
+
+    @dataclass(order=True)
+    class _SchedItem:
+        # heap order: smaller priority first, then older submit
+        priority: int
+        submit_ts: float
+        seq: int
+        sticky_id: str = field(compare=False)
+        prompt_ids: list[int] = field(compare=False)
+        sampling_params: dict[str, Any] = field(compare=False)
+        image_data: Optional[list[Any]] = field(compare=False, default=None)
+        video_data: Optional[list[Any]] = field(compare=False, default=None)
+        fut: asyncio.Future = field(compare=False, default=None)
+
+    async def _scheduler_loop(self):
+        """
+        Global scheduler: starts streams when the chosen server has capacity.
+        """
+        while True:
+            async with self._sched_cv:
+                while not self._pending:
+                    await self._sched_cv.wait()
+
+                # peek best item
+                item = self._pending[0]
+
+                # choose server by sticky_id (consistent routing)
+                server = self._choose_server(item.sticky_id)
+                sid = id(server)
+
+                # if server saturated, wait (but avoid deadlock: wake periodically)
+                if self._inflight.get(sid, 0) >= self.max_inflight_per_server:
+                    # wait for capacity signal
+                    await self._sched_cv.wait()
+                    continue
+
+                # pop and start
+                heapq.heappop(self._pending)
+                self._inflight[sid] = self._inflight.get(sid, 0) + 1
+
+            # start stream outside lock
+            try:
+                vllm_req_id = uuid4().hex
+                res = await server.start_generate_stream.remote(
+                    prompt_ids=item.prompt_ids,
+                    sampling_params=item.sampling_params,
+                    request_id=vllm_req_id,
+                    image_data=item.image_data,
+                    video_data=item.video_data,
+                    priority=item.priority,
+                )
+                # enrich with routing info
+                res["__sticky_id__"] = item.sticky_id
+                res["__server_id__"] = sid
+                item.fut.set_result(res)
+            except Exception as e:
+                item.fut.set_exception(e)
+                # release capacity on failure
+                async with self._sched_cv:
+                    self._inflight[sid] = max(0, self._inflight.get(sid, 0) - 1)
+                    self._sched_cv.notify_all()
 
     @rollout_trace_op
     async def generate(
@@ -110,6 +190,9 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput: token output
         """
+
+        # print("[debug] calling normal generate")
+
         server = self._choose_server(request_id)
         output = await server.generate.remote(
             request_id=uuid4().hex,  # use new request_id for each turn
@@ -119,7 +202,6 @@ class AsyncLLMServerManager:
             video_data=video_data,
         )
         return output
-
 
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
@@ -340,6 +422,15 @@ def register(agent_name: str):
 
     return decorator
 
+def _pick_prompt_tensor(batch):
+    # 不要猜 "prompts"，按常见键兜底
+    if "input_ids" in batch:
+        return batch["input_ids"]
+    if "prompt_ids" in batch:
+        return batch["prompt_ids"]
+    if "prompt_token_ids" in batch:
+        return batch["prompt_token_ids"]
+    raise KeyError(f"no prompt ids key, keys={list(batch.keys())}")
 
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
@@ -357,6 +448,7 @@ class AgentLoopWorker:
             reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
         """
         self.config = config
+        self.server_handles = server_handles
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
@@ -413,6 +505,9 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+
+        # print("[debug] calling sequences in async + tool call")
+
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -807,6 +902,61 @@ class AgentLoopWorker:
             config=self.config.transfer_queue,
         )
 
+    def start_generate_stream_batch(self, gen_batch, replica: int = 0, **kw):
+        print(f"[worker] start_generate_stream_batch replica={replica}", flush=True)
+
+        prompts = _pick_prompt_tensor(gen_batch.batch)
+        attn = gen_batch.batch.get("attention_mask", None)
+
+        # sampling_params：沿用你 generate_sequences 那套（这里直接从 meta_info 取温度等）
+        temperature = float(gen_batch.meta_info.get("temperature", 1.0))
+        top_p = float(gen_batch.meta_info.get("top_p", 1.0))
+        top_k = int(gen_batch.meta_info.get("top_k", -1))
+        max_tokens = int(gen_batch.meta_info.get("max_tokens", gen_batch.meta_info.get("response_length", 1024)))
+        logprobs = bool(gen_batch.meta_info.get("logprobs", False))
+
+        sampling_params = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_tokens": max_tokens,
+            "logprobs": logprobs,
+        }
+
+        server = self.server_handles[replica]
+
+        handles = []
+        request_ids = []
+
+        n = int(prompts.shape[0])
+        for i in range(n):
+            ids = prompts[i].tolist()
+
+            # trim padding by attention_mask
+            if attn is not None:
+                valid_len = int(attn[i].sum().item())
+                if valid_len > 0:
+                    ids = ids[-valid_len:]
+            else:
+                while len(ids) > 0 and ids[0] == 0:
+                    ids = ids[1:]
+
+            rid = uuid4().hex
+            ret = ray.get(server.start_generate_stream.remote(
+                prompt_ids=ids,
+                sampling_params=sampling_params,
+                request_id=rid,
+                **kw,
+            ))
+            handles.append(ret["handle"])
+            request_ids.append(rid)
+
+            if i < 3:
+                print(f"[worker] start #{i} rid={rid} handle={ret['handle']} prompt_len={ret.get('prompt_len')}", flush=True)
+
+        print(f"[worker] started {len(handles)} streams", flush=True)
+        return {"handles": handles, "request_ids": request_ids, "sampling_params": sampling_params}
+
 
 async def get_trajectory_info(step, index, validate):
     """Get trajectory info.
@@ -927,14 +1077,8 @@ class AgentLoopManager:
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Split input batch and dispatch to agent loop workers.
-
-        Args:
-            prompts (DataProto): Input batch.
-
-        Returns:
-            DataProto: Output batch.
-        """
+        """Split input batch and dispatch to agent loop workers."""
+        # print("[debug] Calling generate sequences batched")
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
@@ -946,11 +1090,54 @@ class AgentLoopManager:
         output = DataProto.concat(outputs)
 
         # calculate performance metrics
-        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+        metrics = [output.meta_info.pop("metrics") for output in outputs]
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+        
+
+    def start_generate_stream(self, gen_batch=None, *, prompt_ids=None, sampling_params=None, request_id=None, replica=0, **kw):
+        # mode A: batch (DataProto) -> go through AgentLoopWorker to avoid you手动拆字段
+        if gen_batch is not None:
+            # print(f"[mgr] start_generate_stream(batch) replica={replica}", flush=True)
+            # 走 worker，worker 里批量 start（下面第2步你要加 worker 方法）
+            ref = self.agent_loop_workers[0].start_generate_stream_batch.remote(gen_batch, replica, **kw)
+            return ray.get(ref)
+
+        # mode B: single request
+        assert prompt_ids is not None and sampling_params is not None, "need gen_batch or (prompt_ids,sampling_params)"
+        request_id = request_id or uuid4().hex
+        # print(f"[mgr] start_generate_stream(single) replica={replica} rid={request_id}", flush=True)
+        # DEBUG: print what server handle actually is
+        info = ray.get(self.server_handles[replica].__ray_call__.remote(
+            lambda self: {
+                "type": type(self).__name__,
+                "has_start_generate_stream": hasattr(self, "start_generate_stream"),
+                "has_poll_generate_stream": hasattr(self, "poll_generate_stream"),
+                "has_finalize_generate_stream": hasattr(self, "finalize_generate_stream"),
+                "dir_stream": [x for x in dir(self) if "stream" in x],
+            }
+        ))
+        # print(f"[DEBUG] server_handles[{replica}] -> {info}", flush=True)
+        ref = self.server_handles[replica].start_generate_stream.remote(
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            **kw,
+        )
+        return ray.get(ref)
+
+    def poll_generate_stream_many(self, handles, timeout_ms: int = 5, replica: int = 0):
+        return ray.get(self.server_handles[replica].poll_generate_stream_many.remote(handles, timeout_ms))
+
+    def finalize_generate_stream(self, handle, replica: int = 0):
+        return ray.get(self.server_handles[replica].finalize_generate_stream.remote(handle))
+
+    def cancel_generate_stream(self, handle, replica: int = 0):
+        return ray.get(self.server_handles[replica].cancel_generate_stream.remote(handle))
+
+    # =========================================================================
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}

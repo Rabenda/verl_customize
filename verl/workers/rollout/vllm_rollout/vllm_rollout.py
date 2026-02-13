@@ -265,3 +265,104 @@ class ServerAdapter(BaseRollout):
             "or use HFRollout for synchronous generation. "
             "See https://github.com/volcengine/verl/issues/4682 for more details."
         )
+
+    def supports_step_api(self) -> bool:
+        # 这个是 sync 函数，但 _execute_method 是 async
+        # 所以这里给一个固定 True 更简单；或者你在外层用 await 调
+        return True
+
+    # =========================================================================
+    #  New Explicit Stepping API (Add / Step / Collect)
+    # =========================================================================
+
+    async def add_requests(self, prompts: DataProto) -> list[str]:
+        """
+        [Client Side] Send requests to the remote vLLM server via RPC.
+        Returns:
+            list[str]: A list of generated request_ids (UUIDs) for tracking.
+        """
+        from uuid import uuid4
+        
+        # 1. 准备 Request IDs (在 Client 端生成，方便闭环跟踪)
+        bsz = prompts.batch['prompts'].shape[0]
+        request_ids = [uuid4().hex for _ in range(bsz)]
+
+        prompt_ids_batch = []
+        prompts_tensor = prompts.batch['prompts'] # [B, T]
+        attn = prompts.batch.get('attention_mask', None) # [B, T] or [B, T_total]
+        
+        # 2. 准备 Prompt Token IDs (去除 Padding)
+        for i in range(bsz):
+            ids = prompts_tensor[i].tolist()
+            
+            if attn is not None:
+                # 假设 attn 是左填充的 (0,0,1,1,1)，只取有效部分
+                # 安全起见，只看对应 prompt 长度的部分
+                cur_attn = attn[i]
+                if cur_attn.size(0) >= len(ids):
+                     cur_attn = cur_attn[:len(ids)]
+                
+                valid_len = int(cur_attn.sum().item())
+                # 如果 valid_len 为 0 (异常数据)，保留至少 1 个 token 或者全部
+                if valid_len > 0:
+                    ids = ids[-valid_len:] 
+                else:
+                    # Fallback: remove leading zeros naturally
+                    while len(ids) > 0 and ids[0] == 0:
+                        ids = ids[1:]
+            else:
+                # 无 mask，默认移除 leading zeros
+                while len(ids) > 0 and ids[0] == 0:
+                    ids = ids[1:]
+            
+            prompt_ids_batch.append(ids)
+
+        # 3. 准备 Sampling Params
+        # 优先使用 meta_info 中的参数，如果没有则使用全局配置
+        sampling_params = prompts.meta_info.get("sampling_params", None)
+        if sampling_params is None:
+            sampling_params = dict(
+                temperature=self.config.temperature,
+                top_p=self.config.top_p,
+                top_k=self.config.top_k,
+                repetition_penalty=1.0,
+                logprobs=self.config.calculate_log_probs,
+                # 关键：必须告诉 Server 最长生成多少，否则可能无限生成
+                max_tokens=self.config.response_length, 
+            )
+        
+        # 确保 max_tokens 存在，防止底层 vLLM 报错
+        if "max_tokens" not in sampling_params:
+            sampling_params["max_tokens"] = self.config.response_length
+
+        payload = {
+            "request_ids": request_ids,
+            "prompt_ids_batch": prompt_ids_batch,
+            "sampling_params": sampling_params,
+        }
+
+        # 4. 发送 RPC
+        # 注意：这里假设底层的 Server (vLLMReplica) 已经实现了 add_requests 方法
+        await self._execute_method("add_requests", args=(payload,))
+        
+        return request_ids
+
+    async def step(self, max_steps: int = 1) -> None:
+        """
+        [Client Side] Drive the remote vLLM engine forward by `max_steps`.
+        Waits for the step to complete before returning (Sync-step behavior).
+        """
+        # 这是一个异步 RPC 调用，但在这一行 await，实现了“步进”的同步感
+        await self._execute_method("step", kwargs={"max_steps": max_steps})
+
+    async def collect(self, request_ids: list[str]) -> list[dict]:
+        """
+        [Client Side] Collect generation results/status for specific requests.
+        Returns:
+            list[dict]: A list of dicts containing {token_ids, finished, logprobs, etc.}
+        """
+        # 调用远程 collect
+        results = await self._execute_method("collect", args=(request_ids,))
+        if results is None:
+            return []
+        return results

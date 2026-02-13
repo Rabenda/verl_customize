@@ -621,7 +621,9 @@ class TaskRunner:
         )
 
         trainer.init_workers()
-        trainer.fit()
+        # trainer.fit()
+        # trainer.fit_naive_concurrent_rollout()
+        trainer.fit_overlap_decode()
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
     from verl.utils.dataset.rl_dataset import get_dataset_class
