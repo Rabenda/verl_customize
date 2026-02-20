@@ -67,10 +67,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
-        output = AgentLoopOutput(
+        # 构造返回给 Worker 的对象
+        return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=output.token_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
+            # 传递推理完成的时间戳偏移量
+            generate_finish_time=getattr(output, 'finish_time', 0.0),
+            # 【关键修改】：将生成长度存入 extra_fields 以供后续 Worker 提取
+            extra_fields={
+                "generated_len": getattr(output, 'generated_len', 0)
+            },
             response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
             routed_experts=(
                 output.routed_experts[: len(prompt_ids) + self.response_length]
@@ -81,4 +88,3 @@ class SingleTurnAgentLoop(AgentLoopBase):
             num_turns=2,
             metrics=metrics,
         )
-        return output

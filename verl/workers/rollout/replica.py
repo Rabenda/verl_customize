@@ -41,7 +41,9 @@ class TokenOutput(BaseModel):
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
     """number of preempted times for metric calculation"""
-
+    finish_time: Optional[float] = None
+    """该样本完成推理的相对偏移时间（秒）"""
+    generated_len: int = 0  # 新增：记录生成的 token 数量
 
 class RolloutMode(Enum):
     # Rollout engine and training engine(fsdp/megatron) fused in same process

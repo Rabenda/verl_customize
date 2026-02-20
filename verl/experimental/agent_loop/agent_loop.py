@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
 
+import time
 import hydra
 import numpy as np
 import ray
@@ -232,6 +233,8 @@ class AgentLoopOutput(BaseModel):
     """Number of chat turns, including user, assistant, tool."""
     metrics: AgentLoopMetrics
     """Auxiliary performance metrics"""
+    generate_finish_time: float = 0.0 
+    """LLM 生成完成的时间偏移量"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 
@@ -261,6 +264,7 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
+    generate_finish_time: float = 0.0
 
 
 class DictConfigWrap:
@@ -720,6 +724,7 @@ class AgentLoopWorker:
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
+            generate_finish_time=output.generate_finish_time, # 传递时间戳
             extra_fields=output.extra_fields,
         )
 
@@ -822,6 +827,8 @@ class AgentLoopWorker:
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
+        # 统计每个样本的实际生成长度（排除 padding）
+        generated_lens = torch.tensor([input.response_mask.sum().item() for input in inputs], dtype=torch.int32)
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
@@ -832,6 +839,8 @@ class AgentLoopWorker:
                 "prompts": prompt_ids,  # [bsz, prompt_length]
                 "responses": response_ids,  # [bsz, response_length]
                 "response_mask": response_mask,  # [bsz, response_length]
+                "finish_times": torch.tensor([input.generate_finish_time for input in inputs], dtype=torch.float32),
+                "generated_lens": generated_lens,
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
                 # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
@@ -1080,6 +1089,8 @@ class AgentLoopManager:
         """Split input batch and dispatch to agent loop workers."""
         # print("[debug] Calling generate sequences batched")
 
+        
+        #  分块并分发给各 AgentLoopWorker
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
@@ -1087,13 +1098,63 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        
+        # 3. 合并所有 Worker 返回的数据
         output = DataProto.concat(outputs)
 
-        # calculate performance metrics
-        metrics = [output.meta_info.pop("metrics") for output in outputs]
-        timing = self._performance_metrics(metrics, output)
+        # --- 核心改进：统计有效并行度 (BS) 与总有效序列长度 (SeqLen) ---
+        if 'finish_times' in output.batch.keys() and 'generated_lens' in output.batch.keys():
+            finish_times = output.batch['finish_times'].cpu().numpy()
+            generated_lens = output.batch['generated_lens'].cpu().numpy()
+            
+            sort_idx = np.argsort(finish_times)
+            sorted_times = finish_times[sort_idx]
+            sorted_lens = generated_lens[sort_idx]
+            
+            total_n = len(sorted_times)
+            total_seq_len = np.sum(generated_lens)
+            
+            effective_bs_trace = []
+            effective_seq_len_trace = []
+            
+            current_active_n = total_n
+            current_active_seq_len = float(total_seq_len)
+            
+            # 初始状态：t=0
+            effective_bs_trace.append([0.0, current_active_n])
+            effective_seq_len_trace.append([0.0, current_active_seq_len])
+            
+            for i in range(total_n):
+                t = float(sorted_times[i])
+                sample_len = float(sorted_lens[i])
+                
+                # 记录下降前的点
+                effective_bs_trace.append([t, current_active_n])
+                effective_seq_len_trace.append([t, current_active_seq_len])
+                
+                # 样本完成，更新数值
+                current_active_n -= 1
+                current_active_seq_len -= sample_len
+                
+                # 记录下降后的点
+                effective_bs_trace.append([t, current_active_n])
+                effective_seq_len_trace.append([t, current_active_seq_len])
+            
+            # 将轨迹存入 meta_info
+            output.meta_info['effective_bs_trace'] = effective_bs_trace
+            output.meta_info['effective_seq_len_trace'] = effective_seq_len_trace
 
-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        # 4. 原有的性能指标处理逻辑
+        # 注意：这里统一使用 outputs 获取 metrics
+        metrics_list = [out.meta_info.pop("metrics") for out in outputs]
+        timing = self._performance_metrics(metrics_list, output)
+
+        # 5. 更新 meta_info 并返回
+        output.meta_info.update({
+            "timing": timing, 
+            **outputs[0].meta_info 
+        })
+        
         return output
         
 
@@ -1138,7 +1199,6 @@ class AgentLoopManager:
         return ray.get(self.server_handles[replica].cancel_generate_stream.remote(handle))
 
     # =========================================================================
-
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
