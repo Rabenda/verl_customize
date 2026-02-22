@@ -169,6 +169,7 @@ class RolloutConfig(BaseConfig):
 
     # For dual model serving
     server_name_suffix: Optional[str] = None
+    mps_active_thread_percentage: int = 50
 
     # TODO: enable train_kwargs
     # train_sampling_config: SamplingConfig = field(default_factory=SamplingConfig)

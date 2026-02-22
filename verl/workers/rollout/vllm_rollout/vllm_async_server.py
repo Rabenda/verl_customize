@@ -1046,7 +1046,7 @@ class vLLMReplica(RolloutReplica):
                     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                     "CUDA_MPS_PIPE_DIRECTORY": "/tmp/nvidia-mps",
                     "CUDA_MPS_LOG_DIRECTORY": "/tmp/nvidia-mps-log",
-                    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "50"
+                    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(self.config.mps_active_thread_percentage),
                 }},
                 name=name,
             ).remote(
