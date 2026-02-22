@@ -1,21 +1,21 @@
 set -x
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=2,3
 
-# gsm8k_train_path=/data/verl/gsm8k/train.parquet
-# gsm8k_test_path=/data/verl/gsm8k/test.parquet
+gsm8k_train_path=/data/verl/gsm8k/train.parquet
+gsm8k_test_path=/data/verl/gsm8k/test.parquet
 
 math_train_path=/data/verl/math/train.parquet
 math_test_path=/data/verl/math/test.parquet
 
 aime_train_path=/data/verl/aime/train.parquet
 
-# train_files="['$gsm8k_train_path']"
-# test_files="['$gsm8k_test_path']"
+train_files="['$gsm8k_train_path']"
+test_files="['$gsm8k_test_path']"
 # train_files="['$math_train_path']"
 # test_files="['$math_test_path']"
-train_files="['$aime_train_path']"
-test_files="['$aime_train_path']"
+# train_files="['$aime_train_path']"
+# test_files="['$aime_train_path']"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -26,7 +26,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/data/muxserve/qwen3-4b \
+    actor_rollout_ref.model.path=/data/muxserve/qwen3-0.6b \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -36,7 +36,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -52,7 +52,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name='verl_grpo_qwen3_gsm8k' \
     trainer.experiment_name='qwen3_1.7b_workload_analysis' \
     actor_rollout_ref.rollout.max_model_len=16384 \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=1000 \

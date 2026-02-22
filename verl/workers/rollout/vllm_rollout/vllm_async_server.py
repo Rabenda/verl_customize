@@ -489,6 +489,8 @@ class vLLMHttpServer:
         priority: int = 0,
     ) -> TokenOutput:
         """针对 Workload 测试优化后的生成逻辑"""
+        import time
+        arrival_time = time.time()
         
         # 1. 第一步：先进行多模态 Token 去重（避免长度计算虚高）
         # 如果是纯文本模型且没有对应的处理器，该函数通常会安全返回原数据
@@ -564,6 +566,9 @@ class vLLMHttpServer:
         final_res: Optional[RequestOutput] = None
         async for output in generator:
             final_res = output
+            
+        finish_offset = time.time() - arrival_time
+        
         assert final_res is not None
 
         # 8. 整理结果与日志打印
@@ -640,6 +645,8 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
+            finish_time=finish_offset,  # <-- 在这里填充数据
+            generated_len=len(token_ids)
         )
 
     async def wake_up(self):
