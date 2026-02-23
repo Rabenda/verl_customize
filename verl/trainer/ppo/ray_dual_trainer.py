@@ -1632,7 +1632,7 @@ class DualRayPPOTrainer:
                     progress_bar.close()
                     return
 
-    def fit_overlap_decode(self, start_b_when_active_a_leq: int = 1024, poll_timeout_ms: int = 2000):
+    def fit_overlap_decode(self, start_b_when_active_a_leq: int = 1024, poll_timeout_ms: int = 20):
         import time
         import uuid
         import numpy as np
@@ -1796,7 +1796,9 @@ class DualRayPPOTrainer:
 
                 # ---------- start A ----------
                 print(f"[{_ts()}] [A] starting streaming...", flush=True)
+                t_rollout_a_wall0 = time.perf_counter()
                 t_a_start = time.perf_counter()
+                t_a_start_wall = time.time()
 
                 sampling_a = {
                     "temperature": float(actor_cfg_a.rollout.temperature),
@@ -1830,8 +1832,16 @@ class DualRayPPOTrainer:
                 prompt_ids_b_by_handle = {}
                 t_b_trigger = None
                 t_b_start = None
+                t_b_start_wall = None
                 t_a_done = None
                 t_b_done = None
+                _hl_threshold = 128
+                high_low_a = {"triggered": False, "start_ts": None, "elapsed_s": None}
+                high_low_b = {"triggered": False, "start_ts": None, "elapsed_s": None}
+                first_token_ts_a = {}
+                first_token_ts_b = {}
+                server_prefill_a = {}
+                server_prefill_b = {}
 
                 poll_iter = 0
 
@@ -1850,6 +1860,15 @@ class DualRayPPOTrainer:
                                 typ = ev.get("type")
 
                                 if typ == "delta":
+                                    if h not in first_token_ts_a:
+                                        first_token_ts_a[h] = time.perf_counter()
+                                        mi = ev.get("meta_info", {})
+                                        server_prefill_a[h] = {
+                                            "queue_time": mi.get("queue_time"),
+                                            "prefill_launch_delay": mi.get("prefill_launch_delay"),
+                                            "prefill_launch_latency": mi.get("prefill_launch_latency"),
+                                            "prefill_finished_ts": mi.get("prefill_finished_ts"),
+                                        }
                                     tokbuf_a[h].extend(ev.get("token_ids", []))
                                 elif typ in ("done", "error"):
                                     active_a.discard(h)
@@ -1859,8 +1878,10 @@ class DualRayPPOTrainer:
                     if (not started_b) and (len(active_a) <= start_b_when_active_a_leq):
                         print(f"[{_ts()}] [TRIGGER] start B (active_a={len(active_a)})", flush=True)
                         started_b = True
+                        t_rollout_b_wall0 = time.perf_counter()
                         t_b_trigger = time.perf_counter()
                         t_b_start = t_b_trigger
+                        t_b_start_wall = time.time()
 
                         sampling_b = {
                             "temperature": float(actor_cfg_b.rollout.temperature),
@@ -1892,11 +1913,27 @@ class DualRayPPOTrainer:
                                 ev = item.get("event", item)
                                 typ = ev.get("type")
                                 if typ == "delta":
+                                    if h not in first_token_ts_b:
+                                        first_token_ts_b[h] = time.perf_counter()
+                                        mi = ev.get("meta_info", {})
+                                        server_prefill_b[h] = {
+                                            "queue_time": mi.get("queue_time"),
+                                            "prefill_launch_delay": mi.get("prefill_launch_delay"),
+                                            "prefill_launch_latency": mi.get("prefill_launch_latency"),
+                                            "prefill_finished_ts": mi.get("prefill_finished_ts"),
+                                        }
                                     tokbuf_b[h].extend(ev.get("token_ids", []))
                                 elif typ in ("done", "error"):
                                     active_b.discard(h)
                                     if not active_b and t_b_done is None:
                                         t_b_done = time.perf_counter()
+
+                    if not high_low_a["triggered"] and 0 < len(active_a) < _hl_threshold:
+                        high_low_a["triggered"] = True
+                        high_low_a["start_ts"] = time.perf_counter()
+                    if not high_low_b["triggered"] and started_b and 0 < len(active_b) < _hl_threshold:
+                        high_low_b["triggered"] = True
+                        high_low_b["start_ts"] = time.perf_counter()
 
                     if poll_iter % 50 == 0:
                         print(
@@ -1912,11 +1949,85 @@ class DualRayPPOTrainer:
                 print(f"[{_ts()}] [FINALIZE] A", flush=True)
                 for h in handles_a:
                     mgr_a.finalize_generate_stream(h)
+                t_rollout_a_wall1 = time.perf_counter()
+                print(
+                    f"[{_ts()}] [WALL] rollout_a_total={t_rollout_a_wall1 - t_rollout_a_wall0:.3f}s",
+                    flush=True,
+                )
 
                 if started_b:
                     print(f"[{_ts()}] [FINALIZE] B", flush=True)
                     for h in handles_b:
                         mgr_b.finalize_generate_stream(h)
+                    t_rollout_b_wall1 = time.perf_counter()
+                    print(
+                        f"[{_ts()}] [WALL] rollout_b_total={t_rollout_b_wall1 - t_rollout_b_wall0:.3f}s",
+                        flush=True,
+                    )
+                for _label, _hl, _t_done in [("A", high_low_a, t_a_done), ("B", high_low_b, t_b_done)]:
+                    if _hl["triggered"] and _hl["start_ts"] is not None:
+                        _hl["elapsed_s"] = (_t_done if _t_done else time.perf_counter()) - _hl["start_ts"]
+                        print(
+                            f"[{_ts()}] [HIGH_LOW_{_label}] threshold={_hl_threshold} "
+                            f"tail_to_done={_hl['elapsed_s']:.3f}s",
+                            flush=True,
+                        )
+
+                def _fmt_sec(v):
+                    return f"{v:.3f}s" if v is not None else "NA"
+
+                def _ttft_stats(first_ts_dict, submit_ts):
+                    if not first_ts_dict or submit_ts is None:
+                        return None, None, None, None
+                    latencies = sorted(v - submit_ts for v in first_ts_dict.values())
+                    avg = sum(latencies) / len(latencies)
+                    p50 = latencies[len(latencies) // 2]
+                    return latencies[0], latencies[-1], avg, p50
+
+                def _server_prefill_stats(sp_dict, key):
+                    vals = [d[key] for d in sp_dict.values() if d.get(key) is not None]
+                    if not vals:
+                        return None, None, None, None
+                    vals.sort()
+                    avg = sum(vals) / len(vals)
+                    p50 = vals[len(vals) // 2]
+                    return vals[0], vals[-1], avg, p50
+
+                def _dist_fmt(mn, mx, avg, p50):
+                    if mn is None:
+                        return "NA"
+                    return f"min={mn:.3f}s max={mx:.3f}s avg={avg:.3f}s p50={p50:.3f}s"
+
+                ttft_a = _ttft_stats(first_token_ts_a, t_a_start)
+                ttft_b = _ttft_stats(first_token_ts_b, t_b_start)
+                print(f"[{_ts()}] [TTFT_A] n={len(first_token_ts_a)} {_dist_fmt(*ttft_a)}", flush=True)
+                print(f"[{_ts()}] [TTFT_B] n={len(first_token_ts_b)} {_dist_fmt(*ttft_b)}", flush=True)
+
+                def _prefill_phase_time(sp_dict, start_wall):
+                    ts_list = [d["prefill_finished_ts"] for d in sp_dict.values()
+                               if d.get("prefill_finished_ts") is not None]
+                    if not ts_list or start_wall is None:
+                        return None
+                    return max(ts_list) - start_wall
+
+                prefill_phase_a = _prefill_phase_time(server_prefill_a, t_a_start_wall)
+                prefill_phase_b = _prefill_phase_time(server_prefill_b,
+                                                      t_b_start_wall if started_b else None)
+
+                for _label, _sp, _pf_phase in [("A", server_prefill_a, prefill_phase_a),
+                                                ("B", server_prefill_b, prefill_phase_b)]:
+                    n = len(_sp)
+                    pf_lat = _server_prefill_stats(_sp, "prefill_launch_latency")
+                    qt = _server_prefill_stats(_sp, "queue_time")
+                    pf_delay = _server_prefill_stats(_sp, "prefill_launch_delay")
+                    print(
+                        f"[{_ts()}] [SERVER_PREFILL_{_label}] n={n} "
+                        f"prefill_phase={_fmt_sec(_pf_phase)} "
+                        f"prefill_compute={_dist_fmt(*pf_lat)} "
+                        f"queue_time={_dist_fmt(*qt)} "
+                        f"launch_delay={_dist_fmt(*pf_delay)}",
+                        flush=True,
+                    )
 
                 # ---------- build outputs ----------
                 gen_out_a = _build_output(
@@ -1953,8 +2064,8 @@ class DualRayPPOTrainer:
 
                 print(f"[{_ts()}] [STEP] update_actor / update_critic", flush=True)
 
-                # self._update_actor("a", batch_a)
-                # self._update_actor("b", batch_b)
+                self._update_actor("a", batch_a)
+                self._update_actor("b", batch_b)
                 t_train1 = time.perf_counter()
 
                 a_to_threshold = (t_b_trigger - t_a_start) if t_b_trigger is not None else None
@@ -1963,14 +2074,17 @@ class DualRayPPOTrainer:
                 train_time = t_train1 - t_train0
                 step_total = t_train1 - t_step0
 
-                def _fmt_sec(v):
-                    return f"{v:.3f}s" if v is not None else "NA"
-
                 print(
                     f"[{_ts()}] [WALL] step={self.global_steps} "
                     f"a_to_threshold={_fmt_sec(a_to_threshold)} "
                     f"a_rollout_total={_fmt_sec(a_rollout_total)} "
                     f"b_rollout_total={_fmt_sec(b_rollout_total)} "
+                    f"hl_tail_a={_fmt_sec(high_low_a['elapsed_s'])} "
+                    f"hl_tail_b={_fmt_sec(high_low_b['elapsed_s'])} "
+                    f"prefill_phase_a={_fmt_sec(prefill_phase_a)} "
+                    f"prefill_phase_b={_fmt_sec(prefill_phase_b)} "
+                    f"ttft_a_avg={_fmt_sec(ttft_a[2])} "
+                    f"ttft_b_avg={_fmt_sec(ttft_b[2])} "
                     f"train_time={_fmt_sec(train_time)} "
                     f"step_total={_fmt_sec(step_total)}",
                     flush=True,

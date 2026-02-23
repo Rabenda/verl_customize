@@ -18,10 +18,12 @@ import json
 import logging
 import os
 from typing import Any, Optional
+from uuid import uuid4
 
 import ray
 import sglang
 import sglang.srt.entrypoints.engine
+from sglang.version import __version__ as _sglang_version
 import torch
 from packaging import version
 from ray.actor import ActorHandle
@@ -189,6 +191,11 @@ class SGLangHttpServer:
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
             self.config.load_format = "auto"
 
+        # ===== streaming state (server-side) =====
+        self._stream_queues: dict[str, asyncio.Queue] = {}
+        self._stream_tasks: dict[str, asyncio.Task] = {}
+        self._stream_meta: dict[str, dict] = {}
+
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
@@ -236,7 +243,7 @@ class SGLangHttpServer:
         quantization = self.config.get("quantization", None)
         if quantization is not None:
             if quantization == "fp8":
-                assert version.parse(sglang.__version__) >= version.parse("0.5.5"), (
+                assert version.parse(_sglang_version) >= version.parse("0.5.5"), (
                     "sglang>=0.5.5 is required for FP8 quantization"
                 )
                 FP8_BLOCK_QUANT_KWARGS = {
@@ -306,8 +313,8 @@ class SGLangHttpServer:
         # mtp
         if self.config.mtp.enable and self.config.mtp.enable_rollout:
             # Enable weights CPU backup for sglang >= 0.5.6
-            if sglang.__version__ < "0.5.6":
-                raise ValueError(f"sglang version {sglang.__version__} is not supported for MTP rollout")
+            if _sglang_version < "0.5.6":
+                raise ValueError(f"sglang version {_sglang_version} is not supported for MTP rollout")
 
             args["speculative_algorithm"] = self.config.mtp.speculative_algorithm
             args["speculative_num_steps"] = self.config.mtp.speculative_num_steps
@@ -322,7 +329,9 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
-        if version.parse(sglang.__version__) >= version.parse("0.5.7"):
+        import inspect
+        _launch_sig = inspect.signature(_launch_subprocesses)
+        if "init_tokenizer_manager_func" in _launch_sig.parameters:
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
                 server_args=server_args,
                 init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
@@ -494,6 +503,220 @@ class SGLangHttpServer:
         ):
             await self.tokenizer_manager.stop_profile()
 
+    # =========================
+    # Abort helpers
+    # =========================
+
+    async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        try:
+            self.tokenizer_manager.abort_request(abort_all=True)
+            if reset_prefix_cache:
+                await self.tokenizer_manager.flush_cache()
+            return {"aborted_count": -1, "request_ids": []}
+        except Exception as e:
+            logger.error(f"Error aborting all requests: {e}")
+            return {"aborted_count": 0, "request_ids": [], "error": str(e)}
+
+    async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        try:
+            self.tokenizer_manager.abort_request(rid=request_id)
+            if reset_prefix_cache:
+                await self.tokenizer_manager.flush_cache()
+            return {"aborted": True, "request_id": request_id}
+        except Exception as e:
+            logger.error(f"Error aborting request {request_id}: {e}")
+            return {"aborted": False, "request_id": request_id, "error": str(e)}
+
+    async def wait_for_requests_to_drain(self):
+        pass
+
+    # =========================
+    # Streaming RPC
+    # =========================
+
+    async def start_generate_stream(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        if self.node_rank != 0:
+            raise RuntimeError("start_generate_stream should only be called on node_rank 0")
+
+        actual_prompt_len = len(prompt_ids)
+        max_possible_tokens = self.config.max_model_len - actual_prompt_len
+        if max_possible_tokens < 0:
+            raise ValueError(
+                f"Prompt length ({actual_prompt_len}) exceeds max_model_len ({self.config.max_model_len})."
+            )
+
+        sp = dict(sampling_params)
+        if "max_tokens" in sp:
+            max_tokens = sp.pop("max_tokens")
+        elif "max_new_tokens" in sp:
+            max_tokens = sp.pop("max_new_tokens")
+        else:
+            max_tokens = min(self.config.response_length, max_possible_tokens)
+        max_tokens = max(0, max_tokens)
+
+        return_logprob = sp.pop("logprobs", False)
+        sp["max_new_tokens"] = max_tokens
+
+        request = {
+            "rid": request_id,
+            "input_ids": prompt_ids,
+            "sampling_params": sp,
+            "return_logprob": return_logprob,
+            "stream": True,
+            "image_data": image_data,
+        }
+
+        if self.config.enable_rollout_routing_replay:
+            request["return_routed_experts"] = True
+
+        generate_request = GenerateReqInput(**request)
+
+        handle = uuid4().hex
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._stream_queues[handle] = q
+        self._stream_meta[handle] = {
+            "request_id": request_id,
+            "done": False,
+            "finish_reason": None,
+            "stop_reason": None,
+            "num_preempted": 0,
+            "total_tokens": 0,
+        }
+
+        async def _runner():
+            prev_len = 0
+            is_first_delta = True
+            try:
+                gen = self.tokenizer_manager.generate_request(generate_request, None)
+                async for out in gen:
+                    meta_info = out.get("meta_info", {})
+                    token_ids = out.get("output_ids", [])
+                    if isinstance(token_ids, torch.Tensor):
+                        token_ids = token_ids.tolist()
+
+                    cur_len = len(token_ids)
+                    if cur_len > prev_len:
+                        delta = token_ids[prev_len:cur_len]
+                        prev_len = cur_len
+                        evt = {"type": "delta", "token_ids": delta, "total_tokens": cur_len}
+                        if is_first_delta:
+                            is_first_delta = False
+                            evt["meta_info"] = meta_info
+                        await q.put(evt)
+
+                finish_reason = "stop"
+                stop_reason = "completed"
+
+                self._stream_meta[handle].update({
+                    "done": True,
+                    "finish_reason": finish_reason,
+                    "stop_reason": stop_reason,
+                    "total_tokens": prev_len,
+                })
+                await q.put({
+                    "type": "done",
+                    "finish_reason": finish_reason,
+                    "stop_reason": stop_reason,
+                    "total_tokens": prev_len,
+                    "meta_info": meta_info,
+                })
+
+            except Exception as e:
+                self._stream_meta[handle].update({
+                    "done": True,
+                    "finish_reason": "error",
+                    "stop_reason": "error",
+                    "total_tokens": prev_len,
+                })
+                await q.put({"type": "error", "error": str(e)})
+
+        self._stream_tasks[handle] = asyncio.create_task(_runner())
+
+        return {
+            "handle": handle,
+            "request_id": request_id,
+            "prompt_len": actual_prompt_len,
+            "max_tokens": max_tokens,
+        }
+
+    async def poll_generate_stream(self, handle: str, timeout_s: float = 0.0) -> Optional[dict[str, Any]]:
+        q = self._stream_queues.get(handle)
+        if q is None:
+            return {"type": "error", "error": f"unknown handle {handle}"}
+        try:
+            if timeout_s and timeout_s > 0:
+                return await asyncio.wait_for(q.get(), timeout=timeout_s)
+            return q.get_nowait()
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.QueueEmpty:
+            return None
+
+    async def poll_generate_stream_many(self, handles: list[str], timeout_ms: int = 5) -> list[dict[str, Any]]:
+        timeout_s = max(0.0, float(timeout_ms) / 1000.0)
+
+        async def _poll_one(h, t):
+            msg = await self.poll_generate_stream(h, timeout_s=t)
+            return (h, msg)
+
+        tasks = []
+        for i, h in enumerate(handles):
+            tasks.append(_poll_one(h, timeout_s if i == 0 else 0.0))
+
+        out = await asyncio.gather(*tasks, return_exceptions=False)
+
+        results = []
+        for h, msg in out:
+            if msg is not None:
+                results.append({"handle": h, **msg})
+        return results
+
+    async def finalize_generate_stream(self, handle: str) -> dict[str, Any]:
+        t = self._stream_tasks.get(handle)
+        if t is None:
+            return {"ok": False, "error": f"unknown handle {handle}"}
+        try:
+            await t
+        except Exception:
+            pass
+        meta = self._stream_meta.get(handle, {})
+        self._stream_queues.pop(handle, None)
+        self._stream_tasks.pop(handle, None)
+        self._stream_meta.pop(handle, None)
+        return {"ok": True, **meta}
+
+    async def cancel_generate_stream(self, handle: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        meta = self._stream_meta.get(handle)
+        if meta is None:
+            return {"ok": False, "error": f"unknown handle {handle}"}
+
+        req_id = meta.get("request_id")
+        if req_id is not None:
+            await self.abort_request(req_id, reset_prefix_cache=reset_prefix_cache)
+
+        t = self._stream_tasks.get(handle)
+        if t is not None and not t.done():
+            t.cancel()
+
+        self._stream_meta[handle].update({"done": True, "finish_reason": "cancel", "stop_reason": "cancel"})
+
+        q = self._stream_queues.get(handle)
+        if q is not None:
+            try:
+                await q.put({"type": "done", "finish_reason": "cancel", "stop_reason": "cancel"})
+            except Exception:
+                pass
+
+        return {"ok": True, "handle": handle}
+
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
 
@@ -566,17 +789,26 @@ class SGLangReplica(RolloutReplica):
             )
 
             node_id = worker_node_ids[node_rank * self.gpus_per_replica_node]
+            suffix = getattr(self.config, "server_name_suffix", None) or "default"
             name = (
-                f"sglang_server_{self.replica_rank}_{node_rank}"
+                f"sglang_server_{self.replica_rank}_{node_rank}_{suffix}"
                 if not self.is_reward_model
-                else f"sglang_server_reward_{self.replica_rank}_{node_rank}"
+                else f"sglang_server_reward_{self.replica_rank}_{node_rank}_{suffix}"
             )
+            env_vars = {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}
+            mps_pct = getattr(self.config, "mps_active_thread_percentage", 0)
+            if mps_pct > 0:
+                env_vars.update({
+                    "CUDA_MPS_PIPE_DIRECTORY": "/tmp/nvidia-mps",
+                    "CUDA_MPS_LOG_DIRECTORY": "/tmp/nvidia-mps-log",
+                    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(mps_pct),
+                })
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}},
+                runtime_env={"env_vars": env_vars},
                 name=name,
             ).remote(
                 config=self.config,

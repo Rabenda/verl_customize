@@ -145,7 +145,8 @@ class ServerAdapter(BaseRollout):
             return
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
-        self.server_actor = ray.get_actor(f"sglang_server_{self.replica_rank}_{self.node_rank}")
+        suffix = getattr(self.config, "server_name_suffix", None) or "default"
+        self.server_actor = ray.get_actor(f"sglang_server_{self.replica_rank}_{self.node_rank}_{suffix}")
         server_address, server_port = await self.server_actor.get_server_address.remote()
         logger.debug(
             f"replica_rank={self.replica_rank} node_rank={self.node_rank}, "

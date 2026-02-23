@@ -477,8 +477,8 @@ class TaskRunner:
         from verl.trainer.ppo.reward import load_reward_manager
         from verl.utils.fs import copy_to_local
 
-        print(f"[DualModel] Hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
+        # print(f"[DualModel] Hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        # pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
         assert hasattr(config, "actor_rollout_ref"), "config.actor_rollout_ref must exist (base schema)"
