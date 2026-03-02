@@ -1634,8 +1634,7 @@ class RayPPOTrainer:
                             redundant_time=self.config.trainer.esi_redundant_time,
                         )
                         if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
+                            self.global_steps % self.config.trainer.save_freq == 0
                             or esi_close_to_expiration
                         ):
                             if esi_close_to_expiration:

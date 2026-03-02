@@ -328,6 +328,10 @@ class SGLangHttpServer:
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+        suffix = getattr(self.config, "server_name_suffix", None) or "default"
+        if self.nnodes > 1:
+            suffix = f"{suffix}_n{self.node_rank}"
+        os.environ["SGLANG_INFERENCE_LOG_SUFFIX"] = suffix
         server_args = ServerArgs(**args)
         import inspect
         _launch_sig = inspect.signature(_launch_subprocesses)

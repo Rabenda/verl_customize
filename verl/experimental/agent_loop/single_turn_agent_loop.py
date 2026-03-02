@@ -73,7 +73,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_ids=output.token_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             # 传递推理完成的时间戳偏移量
-            generate_finish_time=getattr(output, 'finish_time', 0.0),
+            generate_finish_time=getattr(output, 'finish_time', None) or 0.0,
             # 【关键修改】：将生成长度存入 extra_fields 以供后续 Worker 提取
             extra_fields={
                 "generated_len": getattr(output, 'generated_len', 0)

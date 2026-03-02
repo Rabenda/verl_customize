@@ -485,8 +485,12 @@ class DualRayPPOTrainer:
             from verl.workers.engine_workers import TrainingWorkerConfig
 
             orig_critic_cfg = critic_cfg
-            if orig_critic_cfg.strategy == "fsdp":
-                engine_config: FSDPEngineConfig = orig_critic_cfg.model.fsdp_config
+            if orig_critic_cfg.strategy in ("fsdp", "fsdp2"):
+                engine_config = orig_critic_cfg.model.fsdp_config
+                engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+                engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
+            elif orig_critic_cfg.strategy == "megatron":
+                engine_config = orig_critic_cfg.megatron
                 engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
                 engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
             else:
@@ -524,6 +528,15 @@ class DualRayPPOTrainer:
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
         wg_kwargs["device_name"] = self.device_name
+
+        trainer_mps_pct = OmegaConf.select(self.config.trainer, "mps_active_thread_percentage", default=0)
+        if trainer_mps_pct and int(trainer_mps_pct) > 0:
+            wg_kwargs["worker_env"] = {
+                "CUDA_MPS_PIPE_DIRECTORY": "/tmp/nvidia-mps",
+                "CUDA_MPS_LOG_DIRECTORY": "/tmp/nvidia-mps-log",
+                "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(trainer_mps_pct),
+            }
+            print(f"[MPS] Training workers will use CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={trainer_mps_pct}", flush=True)
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             if not class_dict:
@@ -1093,58 +1106,34 @@ class DualRayPPOTrainer:
         async_mgr = self._async_mgr(which)
         ckpt_mgr = self._ckpt_mgr(which)
 
-        batch.meta_info["temperature"] = actor_cfg.rollout.temperature
-        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-
-        gen_batch = self._get_gen_batch(batch)
-        gen_batch.meta_info["global_steps"] = self.global_steps
-        gen_batch_output = gen_batch.repeat(repeat_times=actor_cfg.rollout.n, interleave=True)
-
-        # with marked_timer(f"gen_{which}", timing_raw, color="red"):
-        #     gen_batch_output = async_mgr.generate_sequences(gen_batch_output)
-        #     ckpt_mgr.sleep_replicas()
-        #     timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
-        #     gen_batch_output.meta_info.pop("timing", None)
-
-        # --- gen (can be overridden for parallel baseline) ---
         if gen_batch_output_override is None:
+            batch.meta_info["temperature"] = actor_cfg.rollout.temperature
+            batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+
+            gen_batch = self._get_gen_batch(batch)
+            gen_batch.meta_info["global_steps"] = self.global_steps
+            gen_batch_output = gen_batch.repeat(repeat_times=actor_cfg.rollout.n, interleave=True)
+
             with marked_timer(f"gen_{which}", timing_raw, color="red"):
                 gen_batch_output = async_mgr.generate_sequences(gen_batch_output)
                 ckpt_mgr.sleep_replicas()
                 timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                 gen_batch_output.meta_info.pop("timing", None)
 
-            # gen 刚结束就打印（即时）
-            # if getattr(self, "profiler", None) is not None and self.profiler.enabled and self.profiler.verbose:
-            t_local = timing_raw.get(f"gen_{which}", None)
-            # vLLM 内部 timing（如果有）
-            v1 = {k: v for k, v in timing_raw.items()
-                if ("vllm" in k.lower() or "engine" in k.lower())}
-            rtprint(
-                f"[rt] step={self.global_steps} gen_{which} done: "
-                f"{(t_local if t_local is not None else float('nan')):.2f}s"
-                + (f" | vllm_keys={list(v1.keys())[:6]}..." if v1 else "")
-            )
+            rtprint(f"[rt] step={self.global_steps} gen_{which} done: {timing_raw.get(f'gen_{which}', float('nan')):.2f}s")
         else:
-            # override 分支也要有一个“gen_{which}”的 wall time，不然 profile 对不上
             t0 = time.time()
             gen_batch_output = gen_batch_output_override
             ckpt_mgr.sleep_replicas()
-            timing_raw[f"gen_{which}"] = time.time() - t0  # 注意：这里只是 override 分支本地耗时（通常很小）
+            timing_raw[f"gen_{which}"] = time.time() - t0
             timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
             gen_batch_output.meta_info.pop("timing", None)
 
-            # if getattr(self, "profiler", None) is not None and self.profiler.enabled and self.profiler.verbose:
-            t_local = timing_raw.get(f"gen_{which}", None)
-            v1 = {k: v for k, v in timing_raw.items()
-                if ("vllm" in k.lower() or "engine" in k.lower())}
-            rtprint(
-                f"[rt] step={self.global_steps} gen_{which} override-done: "
-                f"{(t_local if t_local is not None else float('nan')):.2f}s"
-                + (f" | vllm_keys={list(v1.keys())[:6]}..." if v1 else "")
-            )
+            rtprint(f"[rt] step={self.global_steps} gen_{which} override-done: {timing_raw[f'gen_{which}']:.2f}s")
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+            if gen_batch_output_override is not None:
+                raise NotImplementedError("REMAX with gen_batch_output_override is not supported")
             if self.reward_fn is None:
                 raise ValueError("A reward_fn is required for REMAX advantage estimation.")
             with marked_timer(f"gen_max_{which}", timing_raw, color="purple"):
@@ -2096,4 +2085,226 @@ class DualRayPPOTrainer:
                 if self.global_steps >= self.total_training_steps:
                     print("========== EXIT fit_overlap_decode ==========", flush=True)
                     progress_bar.close()
+                    return
+
+    # =========================================================================
+    # fit_overlap_b_rollout_a_train
+    #   A rollout (sync) -> B rollout (streaming) || A train -> B train
+    # =========================================================================
+    def fit_overlap_b_rollout_a_train(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from verl.utils.tracking import Tracking
+
+        _ts = lambda: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        _fmt = lambda v: f"{v:.3f}s" if v is not None else "NA"
+
+        print("\n========== ENTER fit_overlap_b_rollout_a_train ==========", flush=True)
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+        self._load_checkpoint()
+
+        self.checkpoint_manager_a.update_weights()
+        self.checkpoint_manager_b.update_weights()
+
+        if self.cfg_a.rollout.get("skip_rollout", False):
+            RolloutSkip(self._build_actor_scoped_config("a"), self.actor_rollout_wg_a).wrap_generate_sequences()
+        if self.cfg_b.rollout.get("skip_rollout", False):
+            RolloutSkip(self._build_actor_scoped_config("b"), self.actor_rollout_wg_b).wrap_generate_sequences()
+
+        current_epoch = self.global_steps // len(self.train_dataloader) if len(self.train_dataloader) > 0 else 0
+
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            self._validate_one("a")
+            self._validate_one("b")
+            if self.config.trainer.get("val_only", False):
+                return
+
+        prof_cfg = self.config.trainer.get("profile", {})
+        self.profiler = StepProfiler(
+            enabled=prof_cfg.get("enabled", True),
+            verbose=prof_cfg.get("verbose", True),
+            print_every=prof_cfg.get("print_every", 1),
+            window=prof_cfg.get("window", 1),
+            print_rollout_each=prof_cfg.get("print_rollout_each", False),
+        )
+
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Dual Training Progress")
+        self.global_steps += 1
+        last_val_metrics = None
+        self.max_steps_duration = 0
+
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                rtprint(f"[{_ts()}] [FIT_OVERLAP] epoch={epoch} step={self.global_steps} begin")
+                metrics = {}
+                timing_raw = {}
+                is_last_step = self.global_steps >= self.total_training_steps
+
+                with marked_timer("step", timing_raw):
+                    batch_base = DataProto.from_single_dict(batch_dict)
+                    batch_a = deepcopy(batch_base)
+                    batch_b = deepcopy(batch_base)
+
+                    actor_cfg_a = self._actor_cfg("a")
+                    batch_a.meta_info["temperature"] = actor_cfg_a.rollout.temperature
+                    batch_a.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch_a.batch))], dtype=object
+                    )
+                    gen_a = self._get_gen_batch(batch_a)
+                    gen_a.meta_info["global_steps"] = self.global_steps
+                    gen_a = gen_a.repeat(repeat_times=actor_cfg_a.rollout.n, interleave=True)
+
+                    actor_cfg_b = self._actor_cfg("b")
+                    batch_b.meta_info["temperature"] = actor_cfg_b.rollout.temperature
+                    batch_b.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch_b.batch))], dtype=object
+                    )
+                    gen_b = self._get_gen_batch(batch_b)
+                    gen_b.meta_info["global_steps"] = self.global_steps
+                    gen_b = gen_b.repeat(repeat_times=actor_cfg_b.rollout.n, interleave=True)
+
+                    mgr_a = self._async_mgr("a")
+                    mgr_b = self._async_mgr("b")
+
+                    # ── Phase 1: A rollout (sync, blocking) ──
+                    t_a_roll0 = time.perf_counter()
+                    with marked_timer("gen_a", timing_raw):
+                        gen_out_a = mgr_a.generate_sequences(gen_a)
+                    t_a_roll1 = time.perf_counter()
+                    rtprint(f"[{_ts()}] [A_ROLLOUT] done {_fmt(t_a_roll1 - t_a_roll0)}")
+
+                    timing_raw.update(gen_out_a.meta_info.get("timing", {}))
+                    gen_out_a.meta_info.pop("timing", None)
+                    if "uid" in batch_a.non_tensor_batch:
+                        gen_out_a.non_tensor_batch["uid"] = batch_a.non_tensor_batch["uid"]
+
+                    # ── Phase 2+3: B rollout (background thread) + A train (main thread) ──
+                    t_overlap0 = time.perf_counter()
+
+                    with ThreadPoolExecutor(max_workers=1) as ex:
+                        fut_b = ex.submit(mgr_b.generate_sequences, gen_b)
+
+                        with marked_timer("step_a", timing_raw):
+                            batch_a, _ = self._step_one_actor(
+                                "a", batch_a, timing_raw, metrics,
+                                gen_batch_output_override=gen_out_a,
+                            )
+
+                        if self.use_critic:
+                            with marked_timer("update_critic_a", timing_raw, color="pink"):
+                                critic_out_a = self._update_critic(batch_a)
+                            metrics.update(reduce_metrics(critic_out_a.meta_info["metrics"]))
+
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            with marked_timer("update_actor_a", timing_raw, color="red"):
+                                actor_out_a = self._update_actor("a", batch_a)
+                            metrics.update(reduce_metrics(actor_out_a.meta_info["metrics"]))
+
+                        t_a_train_done = time.perf_counter()
+
+                        gen_out_b = fut_b.result()
+
+                    t_b_roll_done = time.perf_counter()
+                    t_overlap1 = time.perf_counter()
+
+                    with marked_timer("gen_b", timing_raw):
+                        pass
+                    timing_raw["gen_b"] = t_b_roll_done - t_overlap0
+
+                    timing_raw.update(gen_out_b.meta_info.get("timing", {}))
+                    gen_out_b.meta_info.pop("timing", None)
+                    if "uid" in batch_b.non_tensor_batch:
+                        gen_out_b.non_tensor_batch["uid"] = batch_b.non_tensor_batch["uid"]
+
+                    a_train_wall = t_a_train_done - t_overlap0
+                    b_roll_wall = t_b_roll_done - t_overlap0
+                    overlap_time = min(a_train_wall, b_roll_wall)
+                    b_extra_after_train = max(0.0, b_roll_wall - a_train_wall)
+
+                    rtprint(
+                        f"[{_ts()}] [OVERLAP] a_train={_fmt(a_train_wall)} "
+                        f"b_roll={_fmt(b_roll_wall)} overlap={_fmt(overlap_time)} "
+                        f"b_extra={_fmt(b_extra_after_train)}"
+                    )
+
+                    # ── Phase 4: B train ──
+                    with marked_timer("step_b", timing_raw):
+                        batch_b, _ = self._step_one_actor(
+                            "b", batch_b, timing_raw, metrics,
+                            gen_batch_output_override=gen_out_b,
+                        )
+
+                    if self.use_critic:
+                        with marked_timer("update_critic_b", timing_raw, color="pink"):
+                            critic_out_b = self._update_critic(batch_b)
+                        metrics.update(reduce_metrics(critic_out_b.meta_info["metrics"]))
+
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        with marked_timer("update_actor_b", timing_raw, color="red"):
+                            actor_out_b = self._update_actor("b", batch_b)
+                        metrics.update(reduce_metrics(actor_out_b.meta_info["metrics"]))
+
+                        esi_close_to_expiration = should_save_ckpt_esi(
+                            max_steps_duration=self.max_steps_duration,
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                        )
+                        if self.config.trainer.save_freq > 0 and (
+                            self.global_steps % self.config.trainer.save_freq == 0
+                            or esi_close_to_expiration
+                        ):
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
+
+                        with marked_timer("update_weights_a", timing_raw, color="red"):
+                            self.checkpoint_manager_a.update_weights()
+                        with marked_timer("update_weights_b", timing_raw, color="red"):
+                            self.checkpoint_manager_b.update_weights()
+
+                if (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.test_freq > 0
+                    and (self.global_steps % self.config.trainer.test_freq == 0)
+                ):
+                    with marked_timer("testing", timing_raw, color="green"):
+                        val_a = self._validate_one("a")
+                        val_b = self._validate_one("b")
+                        metrics.update(val_a)
+                        metrics.update(val_b)
+                        if is_last_step:
+                            last_val_metrics = {"a": val_a, "b": val_b}
+
+                steps_duration = timing_raw.get("step", 0.0)
+                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                metrics.update({"training/global_step": self.global_steps, "training/epoch": epoch})
+                metrics.update(rename_dict(compute_data_metrics(batch=batch_a, use_critic=self.use_critic), "data_a/"))
+                metrics.update(rename_dict(compute_data_metrics(batch=batch_b, use_critic=self.use_critic), "data_b/"))
+                metrics.update(compute_timing_metrics(batch=batch_a, timing_raw=timing_raw))
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(compute_throughout_metrics(batch=batch_a, timing_raw=timing_raw, n_gpus=n_gpus))
+                gradient_norm = metrics.get("actor_a/grad_norm", None) or metrics.get("actor_b/grad_norm", None)
+                metrics.update(compute_variance_proxy_metrics(batch=batch_a, gradient_norm=gradient_norm))
+
+                timing_raw["overlap"] = overlap_time
+                timing_raw["b_extra_after_train"] = b_extra_after_train
+
+                if getattr(self, "profiler", None) is not None:
+                    rtprint(f"[{_ts()}] [FIT_OVERLAP] before profiler.update step={self.global_steps}")
+                    self.profiler.update(timing_raw=timing_raw, step=self.global_steps)
+                    rtprint(f"[{_ts()}] [FIT_OVERLAP] after profiler.update step={self.global_steps}")
+
+                progress_bar.update(1)
+                self.global_steps += 1
+
+                if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    print("========== EXIT fit_overlap_b_rollout_a_train ==========", flush=True)
                     return

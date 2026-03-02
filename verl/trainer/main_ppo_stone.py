@@ -621,9 +621,22 @@ class TaskRunner:
         )
 
         trainer.init_workers()
-        # trainer.fit()
-        # trainer.fit_naive_concurrent_rollout()
-        trainer.fit_overlap_decode()
+
+        fit_method = OmegaConf.select(config.trainer, "fit_method", default="overlap_decode")
+        if fit_method == "overlap_b_rollout_a_train":
+            print(f"[FIT] using fit_overlap_b_rollout_a_train", flush=True)
+            trainer.fit_overlap_b_rollout_a_train()
+        elif fit_method == "naive_concurrent_rollout":
+            print(f"[FIT] using fit_naive_concurrent_rollout", flush=True)
+            trainer.fit_naive_concurrent_rollout()
+        elif fit_method == "overlap_decode":
+            print(f"[FIT] using fit_overlap_decode", flush=True)
+            trainer.fit_overlap_decode()
+        elif fit_method == "naive":
+            print(f"[FIT] no overlap", flush=True)
+            trainer.fit()
+        else:
+            raise ValueError(f"Invalid fit_method: {fit_method}")
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
     from verl.utils.dataset.rl_dataset import get_dataset_class

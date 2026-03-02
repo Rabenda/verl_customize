@@ -125,6 +125,12 @@ trainer:
   # Whether to train two models simultaneously
   dual_model: False
 
+  # Fit method for dual model training: overlap_decode, overlap_b_rollout_a_train, naive
+  fit_method: overlap_decode
+
+  # MPS active thread percentage for FSDP training workers (0 = disabled)
+  mps_active_thread_percentage: 0
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
