@@ -420,7 +420,7 @@ class ToolAgentLoop(AgentLoopBase):
         tool, instance_id = None, None
         try:
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments
-            tool_name = tool_call.name
+            tool_name = (tool_call.name or "").strip()
             tool_args = json.loads(tool_call.arguments)
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})

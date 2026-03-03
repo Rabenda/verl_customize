@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 import requests
 
-DEFAULT_TIMEOUT = 30  # Default search request timeout
+DEFAULT_TIMEOUT = 90  # Default search request timeout (increased for slower retrieval e.g. e5-large)
 MAX_RETRIES = 10
 INITIAL_RETRY_DELAY = 1
 API_TIMEOUT = 10
@@ -127,13 +127,37 @@ def call_search_api(
     return None, last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
 
 
+# Common corpus document field names for retrieval result body (server returns raw corpus rows).
+_CONTENT_KEYS = ("contents", "text", "content", "body", "passage")
+
+
+def _get_document_content(doc: Any) -> str:
+    """Get the main text content from a document dict. Tries contents, text, content, body, passage."""
+    if doc is None:
+        return ""
+    if isinstance(doc, str):
+        return doc
+    if not isinstance(doc, dict):
+        return str(doc)
+    for key in _CONTENT_KEYS:
+        val = doc.get(key)
+        if val is not None and isinstance(val, str) and val.strip():
+            return val
+    # Fallback: first string value in the dict
+    for v in doc.values():
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
 def _passages2string(retrieval_result):
     """Convert retrieval results to formatted string."""
     format_reference = ""
     for idx, doc_item in enumerate(retrieval_result):
-        content = doc_item["document"]["contents"]
-        title = content.split("\n")[0]
-        text = "\n".join(content.split("\n")[1:])
+        doc = doc_item.get("document") if isinstance(doc_item, dict) else None
+        content = _get_document_content(doc)
+        title = content.split("\n")[0] if content else ""
+        text = "\n".join(content.split("\n")[1:]) if content else ""
         format_reference += f"Doc {idx + 1} (Title: {title})\n{text}\n\n"
     return format_reference.strip()
 

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import json
 import logging
 import os
@@ -112,6 +113,32 @@ def init_search_execution_pool(
         )
     else:
         raise NotImplementedError("Process mode is not implemented yet")
+
+
+def _parse_query_list_fallback(s: str) -> Optional[list]:
+    """Fallback when json.loads and ast.literal_eval both fail (e.g. "['Andy's teacher']" or plain "The month of May").
+    Returns a list of query strings, or None if nothing usable.
+    """
+    s = s.strip()
+    if not s:
+        return None
+    # Single-quoted list: ['q1', 'q2'] or ['Andy's teacher'] (apostrophe in content)
+    if len(s) >= 4 and s.startswith("['") and s.endswith("']"):
+        inner = s[2:-2].strip()
+        if not inner:
+            return None
+        # Split by "', '" to get multiple elements; single element has no "', '" so we get [inner]
+        parts = [p.strip().strip("'").strip() for p in inner.split("', '")]
+        return [p for p in parts if p]
+    # Double-quoted list: ["q1", "q2"]
+    if len(s) >= 4 and s.startswith('["') and s.endswith('"]'):
+        inner = s[2:-2].strip()
+        if not inner:
+            return None
+        parts = [p.strip().strip('"').strip() for p in inner.split('", "')]
+        return [p for p in parts if p]
+    # Plain text (no list wrapper): use whole string as single query
+    return [s]
 
 
 class SearchTool(BaseTool):
@@ -242,15 +269,74 @@ class SearchTool(BaseTool):
         timeout = self.timeout
         query_list_from_params = parameters.get("query_list")
 
+        logger.debug(
+            "[SearchTool] query_list raw: type=%s repr=%s",
+            type(query_list_from_params).__name__,
+            repr(query_list_from_params),
+        )
+
+        # Normalize query_list: model often outputs a string like "['q1','q2']" or '["q1"]'
+        if isinstance(query_list_from_params, str):
+            s = query_list_from_params.strip()
+            if not s or s in ("[]", "''", '""'):
+                query_list_from_params = None
+            else:
+                json_err, literal_eval_err = None, None
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError as e:
+                    json_err = e
+                    try:
+                        parsed = ast.literal_eval(s)
+                    except (ValueError, SyntaxError) as e2:
+                        literal_eval_err = e2
+                        parsed = None
+                else:
+                    parsed = parsed if isinstance(parsed, list) else None
+                query_list_from_params = parsed if isinstance(parsed, list) else None
+
+                # Fallback when both parsers fail (e.g. single-quoted list with apostrophes: "['Andy's teacher']")
+                if query_list_from_params is None and (json_err is not None or literal_eval_err is not None):
+                    logger.debug(
+                        "[SearchTool] query_list string parse failed, trying fallback: json_err=%s literal_eval_err=%s raw_repr=%s",
+                        json_err,
+                        literal_eval_err,
+                        repr(s),
+                    )
+                    query_list_from_params = _parse_query_list_fallback(s)
+
         if not query_list_from_params or not isinstance(query_list_from_params, list):
-            error_msg = "Error: 'query_list' is missing, empty, or not a list in parameters."
-            logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
-            return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
+            # Return friendly message so trajectory continues instead of hard error
+            result_msg = "No search queries provided. Please provide at least one query string in query_list."
+            logger.debug(
+                "[SearchTool] query_list missing/empty/not list, returning soft result. type=%s repr=%s",
+                type(query_list_from_params).__name__,
+                repr(query_list_from_params),
+            )
+            return ToolResponse(text=json.dumps({"result": result_msg})), 0.0, {}
+
+        # Ensure list of strings (model may output list of dicts e.g. [{"query": "x"}] or mixed types)
+        query_strings = []
+        for item in query_list_from_params:
+            if isinstance(item, str) and item.strip():
+                query_strings.append(item.strip())
+            elif isinstance(item, dict) and item.get("query"):
+                query_strings.append(str(item["query"]).strip())
+            elif item is not None:
+                query_strings.append(str(item).strip())
+        if not query_strings:
+            result_msg = "No valid search queries after normalization. Please provide non-empty query strings in query_list."
+            logger.debug(
+                "[SearchTool] query_list had no valid strings, returning soft result. list_len=%s items_repr=%s",
+                len(query_list_from_params),
+                [repr(x) for x in query_list_from_params],
+            )
+            return ToolResponse(text=json.dumps({"result": result_msg})), 0.0, {}
 
         # Execute search using Ray execution pool
         try:
             result_text, metadata = await self.execution_pool.execute.remote(
-                self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, self.topk, timeout
+                self.execute_search, instance_id, query_strings, self.retrieval_service_url, self.topk, timeout
             )
 
             # Store results in instance dictionary

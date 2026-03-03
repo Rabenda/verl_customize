@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import hashlib
 import logging
 import os
 import re
@@ -143,6 +144,19 @@ class RLHFDataset(Dataset):
         self._download()
         self._read_files_and_tokenize()
 
+    def _get_filtered_cache_path(self) -> Optional[str]:
+        """Return cache dir for filtered dataset, or None if caching disabled. Key includes data_files, max_prompt_length, tool_config_path, max_samples."""
+        if not self.filter_overlong_prompts:
+            return None
+        key = (
+            repr(sorted(self.data_files)),
+            self.max_prompt_length,
+            self.tool_config_path or "",
+            self.max_samples,
+        )
+        h = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+        return os.path.join(self.cache_dir, "filtered_prompts", h)
+
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
 
@@ -176,7 +190,17 @@ class RLHFDataset(Dataset):
             self.dataframe = self.dataframe.select(indices.tolist())
             print(f"selected {self.max_samples} random samples out of {total}")
 
-        self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+        cache_path = self._get_filtered_cache_path()
+        if cache_path and os.path.isdir(cache_path):
+            logger.info("Loading filtered dataset from cache: %s", cache_path)
+            self.dataframe = datasets.load_from_disk(cache_path)
+            print(f"filter dataset len (from cache): {len(self.dataframe)}")
+        else:
+            self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+            if cache_path and self.filter_overlong_prompts:
+                os.makedirs(cache_path, exist_ok=True)
+                self.dataframe.save_to_disk(cache_path)
+                logger.info("Saved filtered dataset to cache: %s", cache_path)
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts

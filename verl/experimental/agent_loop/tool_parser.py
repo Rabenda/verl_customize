@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import json
 import logging
 import os
@@ -72,9 +73,45 @@ class ToolParser(ABC):
         return decorator
 
 
+def _extract_first_json_object(text: str) -> str | None:
+    """Extract the first complete JSON object (balanced braces) from text. Returns None if not found."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _parse_tool_call_obj(obj: dict) -> FunctionCall | None:
+    """Build FunctionCall from dict with 'name' and 'arguments' or 'parameters'. Returns None if invalid."""
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name")
+    args_dict = obj.get("arguments") or obj.get("parameters")
+    if name is None or args_dict is None:
+        return None
+    if isinstance(args_dict, str):
+        try:
+            parsed = json.loads(args_dict)
+            args_dict = parsed if isinstance(parsed, dict) else {"query_list": args_dict}
+        except json.JSONDecodeError:
+            args_dict = {"query_list": args_dict}
+    arguments = json.dumps(args_dict, ensure_ascii=False)
+    return FunctionCall(name=name, arguments=arguments)
+
+
 @ToolParser.register("hermes")
 class HermesToolParser(ToolParser):
-    """Adapted from https://github.com/vllm-project/vllm/blob/v0.9.1/vllm/entrypoints/openai/tool_parsers/hermes_tool_parser.py"""
+    """Adapted from https://github.com/vllm-project/vllm/blob/v0.9.1/vllm/entrypoints/openai/tool_parsers/hermes_tool_parser.py
+    Also supports: unwrapped JSON with \"parameters\" (e.g. {\"name\": \"search\", \"parameters\": {\"query_list\": [...]}}).
+    """
 
     def __init__(self, tokenizer) -> None:
         super().__init__(tokenizer)
@@ -87,23 +124,48 @@ class HermesToolParser(ToolParser):
     async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
         loop = get_event_loop()
         text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
-        if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
-            return text, []
+        function_calls: list[FunctionCall] = []
 
-        matches = self.tool_call_regex.findall(text)
-        function_calls = []
-        for match in matches:
+        # 1) Standard Hermes: <tool_call>...</tool_call> with "name" and "arguments" or "parameters"
+        if self.tool_call_start_token in text and self.tool_call_end_token in text:
+            matches = self.tool_call_regex.findall(text)
+            for match in matches:
+                try:
+                    obj = json.loads(match)
+                    fc = _parse_tool_call_obj(obj)
+                    if fc is not None:
+                        function_calls.append(fc)
+                    else:
+                        logger.debug("Hermes tool_call JSON missing 'name' or 'arguments'/'parameters': %s", match[:200])
+                except Exception as e:
+                    try:
+                        obj = ast.literal_eval(match)
+                        if isinstance(obj, dict):
+                            fc = _parse_tool_call_obj(obj)
+                            if fc is not None:
+                                function_calls.append(fc)
+                            else:
+                                logger.debug("Hermes tool_call (literal_eval) missing 'name' or 'arguments': %s", match[:200])
+                        else:
+                            logger.error("Failed to decode tool call: %s", e)
+                    except Exception:
+                        logger.error("Failed to decode tool call: %s", e)
+            if function_calls:
+                content = self.tool_call_regex.sub("", text)
+                return content, function_calls
+
+        # 2) Fallback: unwrapped JSON e.g. {"name": "search", "parameters": {"query_list": [...]}}
+        first_json = _extract_first_json_object(text)
+        if first_json:
             try:
-                function_call = json.loads(match)
-                name, arguments = function_call["name"], function_call["arguments"]
-                function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
-            except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}")
+                obj = json.loads(first_json)
+                fc = _parse_tool_call_obj(obj)
+                if fc is not None:
+                    return text, [fc]
+            except json.JSONDecodeError:
+                pass
 
-        # remaing text exclude tool call tokens
-        content = self.tool_call_regex.sub("", text)
-
-        return content, function_calls
+        return text, function_calls
 
 
 @ToolParser.register("gpt-oss")
