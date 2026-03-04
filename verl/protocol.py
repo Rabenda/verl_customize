@@ -504,6 +504,28 @@ class DataProto:
         return cls.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info, auto_padding=auto_padding)
 
     @classmethod
+    def from_single_dict_two_copies(
+        cls, data: dict[str, torch.Tensor | np.ndarray], meta_info=None, auto_padding=False
+    ) -> tuple["DataProto", "DataProto"]:
+        """读入时直接生成两份独立副本（tensor.clone/arr.copy），避免 deepcopy 整棵对象树。"""
+        data_a = {}
+        data_b = {}
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                data_a[key] = val.clone()
+                data_b[key] = val.clone()
+            elif isinstance(val, np.ndarray):
+                data_a[key] = val.copy()
+                data_b[key] = val.copy()
+            else:
+                raise ValueError(f"Unsupported type in data {type(val)}")
+        meta_a = copy.copy(meta_info) if meta_info else {}
+        meta_b = copy.copy(meta_info) if meta_info else {}
+        batch_a = cls.from_single_dict(data_a, meta_info=meta_a, auto_padding=auto_padding)
+        batch_b = cls.from_single_dict(data_b, meta_info=meta_b, auto_padding=auto_padding)
+        return batch_a, batch_b
+
+    @classmethod
     def from_dict(
         cls,
         tensors: Optional[dict[str, torch.Tensor]] = None,

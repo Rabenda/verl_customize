@@ -205,21 +205,36 @@ class StepProfiler:
         # 你关心的主路径：rollout(两边) + train(update actor/critic) + ref + reward 等
         keys = [
             "step",
-            "gen_a", "reward_a", "old_log_prob_a", "ref_log_prob_a", "values_a", "adv_a",
-            "gen_b", "reward_b", "old_log_prob_b", "ref_log_prob_b", "values_b", "adv_b",
+            "gen_a", "a_train_wall", "gen_b", "b_train_wall",
+            "reward_a", "old_log_prob_a", "ref_log_prob_a", "values_a", "adv_a",
+            "reward_b", "old_log_prob_b", "ref_log_prob_b", "values_b", "adv_b",
             "update_critic_a", "update_critic_b",
             "update_actor_a", "update_actor_b",
             "save_checkpoint", "update_weights_a", "update_weights_b",
             "testing",
         ]
 
-        # 只打印出现过的 key
         present = [k for k in keys if k in self._hist]
-
-        # 一行：滑动均值（window）+ 总均值
         parts = [f"[profile] step={step} window={self.window}"]
+
+        # a_train = reward_a + old_log_prob_a + ref_log_prob_a + adv_a + update_critic_a + update_actor_a
+        a_train_keys = ["reward_a", "old_log_prob_a", "ref_log_prob_a", "adv_a", "update_critic_a", "update_actor_a"]
+        if any(k in self._hist for k in a_train_keys):
+            a_sum = sum(self.mean(k) for k in a_train_keys if k in self._hist)
+            parts.append(f"a_train_sum={a_sum:.2f}s")
+        if "a_train_wall" in self._hist:
+            parts.append(f"a_train_wall={self.mean('a_train_wall'):.2f}s")
+        # b_train = step_b + update_critic_b + update_actor_b (= reward_b + old_log_prob_b + ref_log_prob_b + adv_b + ...)
+        b_train_keys = ["reward_b", "old_log_prob_b", "ref_log_prob_b", "adv_b", "update_critic_b", "update_actor_b"]
+        if any(k in self._hist for k in b_train_keys):
+            b_sum = sum(self.mean(k) for k in b_train_keys if k in self._hist)
+            parts.append(f"b_train_sum={b_sum:.2f}s")
+        if "b_train_wall" in self._hist:
+            parts.append(f"b_train_wall={self.mean('b_train_wall'):.2f}s")
+
         for k in present:
-            parts.append(f"{k}: {self.mean(k):.2f}s (avg)")
+            if k not in ("a_train_wall", "b_train_wall"):
+                parts.append(f"{k}: {self.mean(k):.2f}s")
         return " | ".join(parts)
 
 # -------------------------
@@ -1341,14 +1356,11 @@ class DualRayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
 
-                batch_base: DataProto = DataProto.from_single_dict(batch_dict)
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
-                    batch_a = deepcopy(batch_base)
+                    batch_a, batch_b = DataProto.from_single_dict_two_copies(batch_dict)
                     batch_a, _ = self._step_one_actor("a", batch_a, timing_raw, metrics)
-
-                    batch_b = deepcopy(batch_base)
                     batch_b, _ = self._step_one_actor("b", batch_b, timing_raw, metrics)
 
                     if self.use_critic:
@@ -1482,12 +1494,10 @@ class DualRayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
 
-                batch_base: DataProto = DataProto.from_single_dict(batch_dict)
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
-                    batch_a = deepcopy(batch_base)
-                    batch_b = deepcopy(batch_base)
+                    batch_a, batch_b = DataProto.from_single_dict_two_copies(batch_dict)
 
                     # -------- 准备 A 的 gen 输入（复制 _step_one_actor 里 gen 前的准备逻辑）--------
                     actor_cfg_a = self._actor_cfg("a")
@@ -1626,7 +1636,6 @@ class DualRayPPOTrainer:
         import uuid
         import numpy as np
         import torch
-        from copy import deepcopy
         from tqdm import tqdm
         from tensordict import TensorDict
         from omegaconf import OmegaConf
@@ -1757,9 +1766,7 @@ class DualRayPPOTrainer:
                 print(f"\n[{_ts()}] [STEP] global_step={self.global_steps}", flush=True)
                 t_step0 = time.perf_counter()
 
-                batch_base = DataProto.from_single_dict(batch_dict)
-                batch_a = deepcopy(batch_base)
-                batch_b = deepcopy(batch_base)
+                batch_a, batch_b = DataProto.from_single_dict_two_copies(batch_dict)
 
                 batch_a.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_a.batch))], dtype=object)
                 batch_b.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_b.batch))], dtype=object)
@@ -2093,6 +2100,15 @@ class DualRayPPOTrainer:
     # =========================================================================
     def fit_overlap_b_rollout_a_train(self):
         from concurrent.futures import ThreadPoolExecutor
+        import time
+        import uuid
+        import numpy as np
+        import torch
+        from tensordict import TensorDict
+        from omegaconf import OmegaConf
+        from pprint import pprint
+
+        from verl import DataProto
         from verl.utils.tracking import Tracking
 
         _ts = lambda: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -2140,6 +2156,97 @@ class DualRayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        # Threshold: start A train only when active B streams are no larger than this.
+        start_a_when_active_b_leq = getattr(
+            self.config.trainer, "start_a_when_active_b_leq", 1024
+        )
+        poll_timeout_ms = getattr(self.config.trainer, "overlap_poll_timeout_ms", 20)
+
+        # Helpers to build prompt ids for streaming rollout (borrowed from fit_overlap_decode)
+        tool_schemas = None
+        tool_config_path = self.config.data.get("tool_config_path", None)
+        if tool_config_path:
+            try:
+                from verl.tools.utils.tool_registry import initialize_tools_from_config
+
+                tool_list = initialize_tools_from_config(tool_config_path)
+                tool_schemas = [
+                    tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
+                ]
+            except Exception:
+                tool_schemas = None
+
+        def _messages_to_prompt_ids(messages):
+            apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
+            if self.processor is not None:
+                raw_prompt = self.processor.apply_chat_template(
+                    messages, tools=tool_schemas, add_generation_prompt=True, tokenize=False, **apply_kwargs
+                )
+                model_inputs = self.processor(text=[raw_prompt], return_tensors="pt")
+                return model_inputs["input_ids"].squeeze(0).tolist()
+            return self.tokenizer.apply_chat_template(
+                messages, tools=tool_schemas, add_generation_prompt=True, tokenize=True, **apply_kwargs
+            )
+
+        def _get_prompt_ids(gen_in: DataProto, idx: int):
+            nt = gen_in.non_tensor_batch
+            if "raw_prompt" in nt:
+                messages = list(nt["raw_prompt"][idx])
+                return _messages_to_prompt_ids(messages)
+
+            if "prompt" in nt:
+                prompt_obj = nt["prompt"][idx]
+                if isinstance(prompt_obj, str):
+                    return self.tokenizer(prompt_obj, add_special_tokens=False)["input_ids"]
+                if isinstance(prompt_obj, (list, tuple)):
+                    if len(prompt_obj) > 0 and isinstance(prompt_obj[0], dict):
+                        return _messages_to_prompt_ids(list(prompt_obj))
+                    if len(prompt_obj) == 0 or isinstance(prompt_obj[0], (int, np.integer)):
+                        return [int(x) for x in prompt_obj]
+
+            raise KeyError(f"cannot build prompt ids, non_tensor keys={list(nt.keys())}")
+
+        def _build_output(gen_in, prompt_ids_by_handle, tokbuf, handles, prompt_length, response_length):
+            bsz = len(handles)
+            prompt_len = int(prompt_length)
+            pad_id = self.tokenizer.pad_token_id or 0
+
+            prompts = torch.full((bsz, prompt_len), int(pad_id), dtype=torch.long)
+            prompt_attn = torch.zeros((bsz, prompt_len), dtype=torch.long)
+            resp = torch.zeros((bsz, response_length), dtype=torch.long)
+            resp_mask = torch.zeros((bsz, response_length), dtype=torch.long)
+
+            for i, h in enumerate(handles):
+                pids = prompt_ids_by_handle.get(h, [])
+                if pids:
+                    pids = pids[-prompt_len:]
+                    lp = len(pids)
+                    prompts[i, prompt_len - lp : prompt_len] = torch.tensor(pids, dtype=torch.long)
+                    prompt_attn[i, prompt_len - lp : prompt_len] = 1
+
+                toks = tokbuf.get(h, [])
+                L = min(len(toks), response_length)
+                if L > 0:
+                    resp[i, :L] = torch.tensor(toks[:L], dtype=torch.long)
+                    resp_mask[i, :L] = 1
+
+            attention_mask = torch.cat([prompt_attn, resp_mask], dim=1)
+            input_ids = torch.cat([prompts, resp], dim=1)
+            position_ids = compute_position_id_with_mask(attention_mask)
+
+            batch = TensorDict(
+                {
+                    "prompts": prompts,
+                    "responses": resp,
+                    "response_mask": resp_mask,
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                },
+                batch_size=bsz,
+            )
+            return DataProto(batch=batch, non_tensor_batch=gen_in.non_tensor_batch, meta_info={"timing": {}})
+
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 rtprint(f"[{_ts()}] [FIT_OVERLAP] epoch={epoch} step={self.global_steps} begin")
@@ -2148,9 +2255,7 @@ class DualRayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
-                    batch_base = DataProto.from_single_dict(batch_dict)
-                    batch_a = deepcopy(batch_base)
-                    batch_b = deepcopy(batch_base)
+                    batch_a, batch_b = DataProto.from_single_dict_two_copies(batch_dict)
 
                     actor_cfg_a = self._actor_cfg("a")
                     batch_a.meta_info["temperature"] = actor_cfg_a.rollout.temperature
@@ -2185,60 +2290,159 @@ class DualRayPPOTrainer:
                     if "uid" in batch_a.non_tensor_batch:
                         gen_out_a.non_tensor_batch["uid"] = batch_a.non_tensor_batch["uid"]
 
-                    # ── Phase 2+3: B rollout (background thread) + A train (main thread) ──
+                    # ── Phase 2: start B rollout (streaming) ──
+                    sampling_b = {
+                        "temperature": float(actor_cfg_b.rollout.temperature),
+                        "max_tokens": int(actor_cfg_b.rollout.response_length),
+                    }
+                    handles_b = []
+                    active_b = set()
+                    tokbuf_b = {}
+                    prompt_ids_b_by_handle = {}
+
+                    for i in range(len(gen_b)):
+                        ids = _get_prompt_ids(gen_b, i)
+                        rid = str(uuid.uuid4())
+                        ret = mgr_b.start_generate_stream(
+                            prompt_ids=ids,
+                            sampling_params=sampling_b,
+                            request_id=rid,
+                        )
+                        h = ret["handle"]
+                        handles_b.append(h)
+                        active_b.add(h)
+                        tokbuf_b[h] = []
+                        prompt_ids_b_by_handle[h] = ids
+
+                    rtprint(
+                        f"[{_ts()}] [B_STREAM] started {len(active_b)} streams, "
+                        f"start_a_when_active_b_leq={start_a_when_active_b_leq}",
+                    )
+
+                    # ── Phase 3: poll B; when active_b <= threshold, start A train in a thread ──
+                    overlap_time = 0.0
+                    b_extra_after_train = 0.0
                     t_overlap0 = time.perf_counter()
 
-                    with ThreadPoolExecutor(max_workers=1) as ex:
-                        fut_b = ex.submit(mgr_b.generate_sequences, gen_b)
+                    started_a_train = False
+                    a_train_done = False
 
-                        with marked_timer("step_a", timing_raw):
-                            batch_a, _ = self._step_one_actor(
-                                "a", batch_a, timing_raw, metrics,
-                                gen_batch_output_override=gen_out_a,
-                            )
+                    def _run_a_train():
+                        nonlocal batch_a, a_train_done
+                        rtprint(f"[{_ts()}] [A_TRAIN] start (overlap with B)")
+                        t_train_a0 = time.perf_counter()
+
+                        local_timing = {}
+                        local_metrics = {}
+                        batch_a_local, _ = self._step_one_actor(
+                            "a", batch_a, local_timing, local_metrics, gen_batch_output_override=gen_out_a
+                        )
+                        batch_a = batch_a_local
 
                         if self.use_critic:
-                            with marked_timer("update_critic_a", timing_raw, color="pink"):
+                            with marked_timer("update_critic_a", local_timing, color="pink"):
                                 critic_out_a = self._update_critic(batch_a)
-                            metrics.update(reduce_metrics(critic_out_a.meta_info["metrics"]))
 
                         if self.config.trainer.critic_warmup <= self.global_steps:
-                            with marked_timer("update_actor_a", timing_raw, color="red"):
-                                actor_out_a = self._update_actor("a", batch_a)
-                            metrics.update(reduce_metrics(actor_out_a.meta_info["metrics"]))
+                            with marked_timer("update_actor_a", local_timing, color="red"):
+                                self._update_actor("a", batch_a)
 
-                        t_a_train_done = time.perf_counter()
+                        t_train_a1 = time.perf_counter()
+                        local_timing["a_train_wall"] = t_train_a1 - t_train_a0
+                        rtprint(
+                            f"[{_ts()}] [A_TRAIN] done, wall={_fmt(local_timing['a_train_wall'])}",
+                        )
+                        a_train_done = True
+                        return local_timing
 
-                        gen_out_b = fut_b.result()
+                    with ThreadPoolExecutor(max_workers=1) as ex:
+                        fut_a = None
+                        t_a_train_start = None
+                        t_a_train_end = None
+                        poll_iter = 0
 
-                    t_b_roll_done = time.perf_counter()
+                        while True:
+                            poll_iter += 1
+
+                            if active_b:
+                                poll_b = mgr_b.poll_generate_stream_many(list(active_b), timeout_ms=poll_timeout_ms)
+                                if poll_b:
+                                    for item in poll_b:
+                                        h = item["handle"]
+                                        ev = item.get("event", item)
+                                        typ = ev.get("type")
+                                        if typ == "delta":
+                                            tokbuf_b[h].extend(ev.get("token_ids", []))
+                                        elif typ in ("done", "error"):
+                                            active_b.discard(h)
+
+                            if (not started_a_train) and (len(active_b) <= start_a_when_active_b_leq):
+                                rtprint(
+                                    f"[{_ts()}] [TRIGGER_A_TRAIN] active_b={len(active_b)} "
+                                    f"<= {start_a_when_active_b_leq}",
+                                )
+                                started_a_train = True
+                                t_a_train_start = time.perf_counter()
+                                fut_a = ex.submit(_run_a_train)
+
+                            # Exit polling as soon as all B streams finish.
+                            # A 训练线程在循环外用 fut_a.result() 等待即可。
+                            if not active_b:
+                                rtprint(
+                                    f"[{_ts()}] [POLL_B] exit loop "
+                                    f"(active_b={len(active_b)}, started_a_train={started_a_train}, "
+                                    f"a_train_done={a_train_done})",
+                                )
+                                break
+
+                            if poll_iter % 50 == 0:
+                                rtprint(
+                                    f"[{_ts()}] [POLL_B] iter={poll_iter} active_b={len(active_b)}"
+                                )
+
+                        if fut_a is not None:
+                            local_timing = fut_a.result()
+                            t_a_train_end = time.perf_counter()
+                            timing_raw.update(local_timing)
+                        else:
+                            t_a_train_start = t_a_train_end = None
+
                     t_overlap1 = time.perf_counter()
 
-                    with marked_timer("gen_b", timing_raw):
-                        pass
-                    timing_raw["gen_b"] = t_b_roll_done - t_overlap0
+                    # Finalize B streams
+                    for h in handles_b:
+                        mgr_b.finalize_generate_stream(h)
 
-                    timing_raw.update(gen_out_b.meta_info.get("timing", {}))
-                    gen_out_b.meta_info.pop("timing", None)
-                    if "uid" in batch_b.non_tensor_batch:
-                        gen_out_b.non_tensor_batch["uid"] = batch_b.non_tensor_batch["uid"]
+                    # Build B rollout outputs from streamed tokens
+                    gen_out_b = _build_output(
+                        gen_b,
+                        prompt_ids_b_by_handle,
+                        tokbuf_b,
+                        handles_b,
+                        int(actor_cfg_b.rollout.prompt_length),
+                        int(actor_cfg_b.rollout.response_length),
+                    )
 
-                    a_train_wall = t_a_train_done - t_overlap0
-                    b_roll_wall = t_b_roll_done - t_overlap0
-                    overlap_time = min(a_train_wall, b_roll_wall)
+                    # Overlap statistics (approximate)
+                    if t_a_train_start is not None and t_a_train_end is not None:
+                        a_train_wall = t_a_train_end - t_a_train_start
+                    else:
+                        a_train_wall = 0.0
+                    b_roll_wall = t_overlap1 - t_overlap0
+                    overlap_time = min(a_train_wall, b_roll_wall) if a_train_wall > 0 else 0.0
                     b_extra_after_train = max(0.0, b_roll_wall - a_train_wall)
 
                     rtprint(
                         f"[{_ts()}] [OVERLAP] a_train={_fmt(a_train_wall)} "
                         f"b_roll={_fmt(b_roll_wall)} overlap={_fmt(overlap_time)} "
-                        f"b_extra={_fmt(b_extra_after_train)}"
+                        f"b_extra={_fmt(b_extra_after_train)}",
                     )
 
                     # ── Phase 4: B train ──
+                    t_b_train0 = time.perf_counter()
                     with marked_timer("step_b", timing_raw):
                         batch_b, _ = self._step_one_actor(
-                            "b", batch_b, timing_raw, metrics,
-                            gen_batch_output_override=gen_out_b,
+                            "b", batch_b, timing_raw, metrics, gen_batch_output_override=gen_out_b
                         )
 
                     if self.use_critic:
@@ -2250,6 +2454,9 @@ class DualRayPPOTrainer:
                         with marked_timer("update_actor_b", timing_raw, color="red"):
                             actor_out_b = self._update_actor("b", batch_b)
                         metrics.update(reduce_metrics(actor_out_b.meta_info["metrics"]))
+                        t_b_train1 = time.perf_counter()
+                        timing_raw["b_train_wall"] = t_b_train1 - t_b_train0
+                        rtprint(f"[{_ts()}] [B_TRAIN] done {_fmt(timing_raw['b_train_wall'])}")
 
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,

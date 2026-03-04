@@ -1394,7 +1394,7 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         # 记录进入生成前的起始点
                         step_wall_time = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(step_wall_time * 1000))
+                        # logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(step_wall_time * 1000))
 
                         if not self.async_rollout_mode:
                             # decoding
@@ -1417,12 +1417,12 @@ class RayPPOTrainer:
                                 }, step=int((step_wall_time + t_offset) * 1000))
                                 
                         seq_trace = gen_batch_output.meta_info.get('effective_seq_len_trace')
-                        if seq_trace:
-                            for t_offset, total_len in seq_trace:
-                                # 记录总活跃序列长度随时间的变化
-                                logger.log({
-                                    "profiler/total_active_tokens": total_len
-                                }, step=int((step_wall_time + t_offset) * 1000))
+                        # if seq_trace:
+                        #     for t_offset, total_len in seq_trace:
+                        #         # 记录总活跃序列长度随时间的变化
+                        #         logger.log({
+                        #             "profiler/total_active_tokens": total_len
+                        #         }, step=int((step_wall_time + t_offset) * 1000))
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
