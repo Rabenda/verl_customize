@@ -128,3 +128,10 @@ logs
 log
 outputs
 .history
+
+# formal_log 需提交到云端，不忽略
+!formal_log/
+!formal_log/*.log
+
+# formal_plot 不纳入版本控制
+formal_plot/
