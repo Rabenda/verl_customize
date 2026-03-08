@@ -29,7 +29,7 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
-from verl.utils.import_utils import load_extern_object
+from verl.utils.import_utils import load_class_from_fqn, load_extern_object
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -345,8 +345,13 @@ class TaskRunner:
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
+        trainer_cls = RayPPOTrainer
+        trainer_class_fqn = config.trainer.get("trainer_class", None)
+        if trainer_class_fqn:
+            trainer_cls = load_class_from_fqn(trainer_class_fqn, "RayPPOTrainer")
+
         # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,

@@ -28,11 +28,12 @@ from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.ray_dual_trainer import DualRayPPOTrainer
+from verl.trainer.ppo.ray_dual_one_step_off_trainer import DualRayOneStepOffPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
-from verl.utils.import_utils import load_extern_object
+from verl.utils.import_utils import load_class_from_fqn, load_extern_object
 
 from dataclasses import fields as dc_fields
 
@@ -201,7 +202,27 @@ def main(config):
     run_ppo(config)
 
 
+def _set_global_seed(seed: int) -> None:
+    """Set random seed for reproducibility across Python, NumPy, and PyTorch."""
+    import random
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
 def run_ppo(config, task_runner_class=None) -> None:
+    # Set global seed for reproducibility if configured
+    seed = OmegaConf.select(config, "trainer.seed")
+    if seed is not None:
+        _set_global_seed(int(seed))
+        print(f"[run_ppo] Set global seed to {seed}", flush=True)
+
     if not ray.is_initialized():
         default_runtime_env = get_ppo_ray_runtime_env()
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
@@ -442,7 +463,12 @@ class TaskRunner:
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        trainer = RayPPOTrainer(
+        trainer_cls = RayPPOTrainer
+        trainer_class_fqn = config.trainer.get("trainer_class", None)
+        if trainer_class_fqn:
+            trainer_cls = load_class_from_fqn(trainer_class_fqn, "RayPPOTrainer")
+
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
@@ -605,7 +631,11 @@ class TaskRunner:
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        trainer = DualRayPPOTrainer(
+        fit_method = OmegaConf.select(config.trainer, "fit_method", default="overlap_decode")
+        use_one_step_off = fit_method in ("serial_step_rollout_train_overlap", "full_parallel")
+        trainer_cls = DualRayOneStepOffPPOTrainer if use_one_step_off else DualRayPPOTrainer
+
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
@@ -621,9 +651,19 @@ class TaskRunner:
         )
 
         trainer.init_workers()
+        print(f"[FIT] init_workers DONE, fit_method={fit_method}", flush=True)
 
-        fit_method = OmegaConf.select(config.trainer, "fit_method", default="overlap_decode")
-        if fit_method == "overlap_b_rollout_a_train":
+        if fit_method == "profile":
+            print(f"[FIT] running profile_substages ...", flush=True)
+            trainer.profile_substages()
+            print(f"[FIT] profile_substages DONE", flush=True)
+        elif fit_method == "serial_step_rollout_train_overlap":
+            print(f"[FIT] using fit_serial_step_rollout_train_overlap (one-step off-policy)", flush=True)
+            trainer.fit_serial_step_rollout_train_overlap()
+        elif fit_method == "full_parallel":
+            print(f"[FIT] using fit_full_parallel (A/B rollout+train overlap)", flush=True)
+            trainer.fit_full_parallel()
+        elif fit_method == "overlap_b_rollout_a_train":
             print(f"[FIT] using fit_overlap_b_rollout_a_train", flush=True)
             trainer.fit_overlap_b_rollout_a_train()
         elif fit_method == "naive_concurrent_rollout":

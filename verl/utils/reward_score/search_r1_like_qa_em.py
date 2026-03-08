@@ -105,7 +105,7 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
     """
     answer = extract_solution(solution_str=solution_str)
     open_count, close_count = count_answer_tags(solution_str)
-    do_print = random.randint(1, 64) == 1
+    do_print = False #random.randint(1, 64) == 1
 
     if do_print:
         print("--------------------------------")

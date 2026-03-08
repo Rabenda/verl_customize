@@ -620,22 +620,68 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
 
+    # ---- Green Context for SM partitioning profiling ----
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_sm_count(self) -> int:
+        """Return GPU SM count (for profiling). Runs on worker with CUDA."""
+        return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_green_context(self, sm_count: int):
+        """Initialize a green context stream limited to `sm_count` SMs.
+
+        All subsequent compute_log_prob / compute_ref_log_prob / update_actor
+        calls will execute on this stream until clear_green_context() is called.
+        """
+        from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        streams, resources = split_device_green_ctx_by_sm_count(dev, [sm_count])
+        self._green_stream = streams[0]
+        self._green_resources = resources
+        self._green_sm_count = sm_count
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_green_context(self):
+        """Remove green context; revert to default stream."""
+        self._green_stream = None
+        self._green_resources = None
+        self._green_sm_count = 0
+
+    def _green_stream_ctx(self):
+        green = getattr(self, "_green_stream", None)
+        return torch.cuda.stream(green) if green else nullcontext()
+
+    def _green_sync(self):
+        green = getattr(self, "_green_stream", None)
+        if green is not None:
+            green.synchronize()
+
+    # ---- forward / backward with optional green context ----
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
-        output = self.ref.infer_batch(data=data)
+        with self._green_stream_ctx():
+            output = self.ref.infer_batch(data=data)
+        self._green_sync()
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
-        output = self.actor.infer_batch(data)
+        with self._green_stream_ctx():
+            output = self.actor.infer_batch(data)
+        self._green_sync()
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.train_mini_batch(data=data)
+        with self._green_stream_ctx():
+            output = self.actor.train_mini_batch(data=data)
+        self._green_sync()
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

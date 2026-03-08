@@ -20,7 +20,6 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
 
-import time
 import hydra
 import numpy as np
 import ray
@@ -54,8 +53,6 @@ import time
 from dataclasses import dataclass, field
 
 from typing import AsyncIterator, List, Dict, Any, Optional
-
-import traceback
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -97,6 +94,13 @@ class AsyncLLMServerManager:
         self._sched_cv = asyncio.Condition(self._sched_lock)
         self._pending = []  # heap of _SchedItem
         self._seq = 0
+
+        # ===== handle routing (stream handle -> server actor) =====
+        self._handle_to_server: dict[str, ray.actor.ActorHandle] = {}
+
+        # inflight decrement must be serialized per server
+        self._inflight_lock = asyncio.Lock()
+
         self._sched_task = asyncio.create_task(self._scheduler_loop())
 
     def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
@@ -126,26 +130,21 @@ class AsyncLLMServerManager:
     async def _scheduler_loop(self):
         """
         Global scheduler: starts streams when the chosen server has capacity.
+        IMPORTANT: must register handle->server, and inflight must be decremented on finish/cancel.
         """
         while True:
             async with self._sched_cv:
                 while not self._pending:
                     await self._sched_cv.wait()
 
-                # peek best item
                 item = self._pending[0]
-
-                # choose server by sticky_id (consistent routing)
                 server = self._choose_server(item.sticky_id)
                 sid = id(server)
 
-                # if server saturated, wait (but avoid deadlock: wake periodically)
                 if self._inflight.get(sid, 0) >= self.max_inflight_per_server:
-                    # wait for capacity signal
                     await self._sched_cv.wait()
                     continue
 
-                # pop and start
                 heapq.heappop(self._pending)
                 self._inflight[sid] = self._inflight.get(sid, 0) + 1
 
@@ -160,16 +159,102 @@ class AsyncLLMServerManager:
                     video_data=item.video_data,
                     priority=item.priority,
                 )
+
+                # register handle -> server (REQUIRED for polling/finalize/cancel)
+                handle = res["handle"]
+                self._handle_to_server[handle] = server
+
                 # enrich with routing info
                 res["__sticky_id__"] = item.sticky_id
                 res["__server_id__"] = sid
                 item.fut.set_result(res)
+
             except Exception as e:
                 item.fut.set_exception(e)
-                # release capacity on failure
+                # release capacity on start failure
                 async with self._sched_cv:
                     self._inflight[sid] = max(0, self._inflight.get(sid, 0) - 1)
                     self._sched_cv.notify_all()
+
+    async def start_generate_stream(
+        self,
+        *,
+        sticky_id: str,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        priority: int = 0,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+    ) -> dict[str, Any]:
+        """
+        Submit one stream-start request into the global scheduler and wait until the stream handle is returned.
+        Returns dict that MUST include "handle".
+        """
+        fut = asyncio.get_running_loop().create_future()
+        async with self._sched_cv:
+            self._seq += 1
+            item = AsyncLLMServerManager._SchedItem(
+                priority=int(priority),
+                submit_ts=time.time(),
+                seq=self._seq,
+                sticky_id=sticky_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+                fut=fut,
+            )
+            heapq.heappush(self._pending, item)
+            self._sched_cv.notify_all()
+        return await fut
+
+    async def _release_inflight(self, server: ray.actor.ActorHandle):
+        sid = id(server)
+        async with self._sched_cv:
+            self._inflight[sid] = max(0, self._inflight.get(sid, 0) - 1)
+            self._sched_cv.notify_all()
+
+    async def poll_stream(self, handle: str, timeout_s: float = 0.02) -> Optional[dict[str, Any]]:
+        """
+        Poll one stream handle.
+        - returns: None | {"type":"delta",...} | {"type":"done",...} | {"type":"error",...}
+        - automatically releases inflight on done/error and cleans handle mapping.
+        """
+        server = self._handle_to_server.get(handle)
+        if server is None:
+            return {"type": "error", "error": f"unknown handle {handle}"}
+
+        msg = await server.poll_generate_stream.remote(handle, timeout_s=timeout_s)
+        if msg is None:
+            return None
+
+        t = msg.get("type")
+
+        if t == "delta":
+            return msg
+
+        if t in ("done", "error"):
+            await server.finalize_generate_stream.remote(handle)
+            self._handle_to_server.pop(handle, None)
+            await self._release_inflight(server)
+            return msg
+
+        return {"type": "error", "error": f"bad msg type: {t}, msg={msg}"}
+
+    async def cancel_stream(self, handle: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        """
+        Cancel one stream handle.
+        - always releases inflight and forgets handle mapping.
+        """
+        server = self._handle_to_server.get(handle)
+        if server is None:
+            return {"ok": False, "error": f"unknown handle {handle}"}
+
+        res = await server.cancel_generate_stream.remote(handle, reset_prefix_cache=reset_prefix_cache)
+        await server.finalize_generate_stream.remote(handle)
+        self._handle_to_server.pop(handle, None)
+        await self._release_inflight(server)
+        return res
 
     @rollout_trace_op
     async def generate(
@@ -192,7 +277,7 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
 
-        # print("[debug] calling normal generate")
+        print("[debug] calling normal generate")
 
         server = self._choose_server(request_id)
         output = await server.generate.remote(
@@ -203,6 +288,144 @@ class AsyncLLMServerManager:
             video_data=video_data,
         )
         return output
+
+    async def add_requests(self, prompts: DataProto) -> List[str]:
+        """
+        [Sync-API] 发送 Prompts 到 Server，但不开始生成。
+        对应 Server 端的 add_requests 接口。
+        """
+        # 1. 准备 Request IDs (Client 生成，全链路追踪)
+        bsz = prompts.batch["prompts"].shape[0]
+        request_ids = [uuid4().hex for _ in range(bsz)]
+
+        # 2. 准备 Payload (对齐 Codex 提到的参数格式)
+        prompt_ids_batch = []
+        prompts_tensor = prompts.batch["prompts"]
+        attn = prompts.batch.get("attention_mask", None)
+
+        for i in range(bsz):
+            ids = prompts_tensor[i].tolist()
+            # 处理 Padding (移除 leading zeros 或根据 mask 截断)
+            if attn is not None:
+                cur_attn = attn[i]
+                if cur_attn.size(0) >= len(ids):
+                    cur_attn = cur_attn[: len(ids)]
+                valid_len = int(cur_attn.sum().item())
+                if valid_len > 0:
+                    ids = ids[-valid_len:]
+                else:
+                    while len(ids) > 0 and ids[0] == 0:
+                        ids = ids[1:]
+            else:
+                while len(ids) > 0 and ids[0] == 0:
+                    ids = ids[1:]
+            prompt_ids_batch.append(ids)
+
+        # 3. 准备 Sampling Params
+        # 注意 Codex 提到的：必须确保 max_tokens 存在
+        meta_params = prompts.meta_info.get("sampling_params", {})
+        # 获取全局配置兜底 (假设你有 self.config)
+        default_max_tokens = getattr(self.config, "response_length", 1024) if hasattr(self, "config") else 1024
+
+        sampling_params = {
+            "temperature": meta_params.get("temperature", 1.0),
+            "top_p": meta_params.get("top_p", 1.0),
+            "top_k": meta_params.get("top_k", -1),
+            "max_tokens": meta_params.get("max_tokens", default_max_tokens),
+            "logprobs": meta_params.get("logprobs", 1),  # 通常需要 logprobs
+            "ignore_eos": meta_params.get("ignore_eos", False),
+        }
+
+        payload = {
+            "request_ids": request_ids,
+            "prompt_ids_batch": prompt_ids_batch,
+            "sampling_params": sampling_params,
+            # 如果有多模态数据，在这里加 "image_data": ...
+        }
+
+        # 4. 发送 RPC (使用 collective_rpc 调用 server 端的 add_requests)
+        # 假设 self.server_handles 是一个列表，我们通常发给 Rank 0 或者所有
+        # 如果是 SPMD 架构，通常发给 handle[0] 即可
+        target_server = self.server_handles[0]  # 或者 self.rollout_worker
+
+        await target_server.collective_rpc.remote("add_requests", args=(payload,))
+
+        return request_ids
+
+    async def step(self, max_steps: int = 1) -> None:
+        """
+        [Sync-API] 驱动 Server 往前推理 max_steps 步。
+        """
+        target_server = self.server_handles[0]
+        # 这是一个 RPC 调用，但在这一行 await 保证了同步性
+        await target_server.collective_rpc.remote("step", kwargs={"max_steps": max_steps})
+
+    async def collect(self, request_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        [Sync-API] 收集指定 Request ID 的最新输出。
+        """
+        if not request_ids:
+            return []
+
+        target_server = self.server_handles[0]
+        results = await target_server.collective_rpc.remote("collect", args=(request_ids,))
+
+        # 兜底：如果 Server 返回 None
+        return results if results is not None else []
+
+    # =========================================================================
+    # 2. 高级流式接口 (The Stream Iterator)
+    #    这是给 AgentLoop 用的核心工具
+    # =========================================================================
+
+    async def generate_stream_iterator(self, prompts: DataProto) -> AsyncIterator[Dict[str, Any]]:
+        """
+        全自动步进生成器。
+        用法:
+            async for batch_results in manager.generate_stream_iterator(prompts):
+                # check results...
+        """
+        # 1. 提交任务
+        req_ids = await self.add_requests(prompts)
+        active_req_ids = set(req_ids)
+
+        # 2. 循环步进
+        while active_req_ids:
+            # --- A. 步进 (Step) ---
+            # 每次只推 1 步，给你最大的控制权
+            await self.step(max_steps=1)
+
+            # --- B. 收集 (Collect) ---
+            current_ids = list(active_req_ids)
+            batch_results = await self.collect(current_ids)
+
+            # --- C. 封装并 Yield ---
+            yield_payload = {}
+            finished_ids = []
+
+            for res in batch_results:
+                rid = res["request_id"]  # 确保 Server 端返回这个 key
+
+                # 兼容性处理：把 Server 返回的 raw dict 转成你上层需要的格式
+                # 假设 res 包含: {'new_token_ids': [123], 'finished': False, 'logprobs': ...}
+                yield_payload[rid] = {
+                    "new_token_ids": res.get("new_token_ids", []),
+                    "finished": res.get("finished", False),
+                    "logprobs": res.get("logprobs", None),
+                    "text": res.get("text", ""),  # 可选
+                }
+
+                if res.get("finished", False):
+                    finished_ids.append(rid)
+
+            # 更新活跃列表
+            for rid in finished_ids:
+                active_req_ids.discard(rid)
+
+            # 只有当这一步有产出时才 yield
+            if yield_payload:
+                yield yield_payload
+
 
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
@@ -233,8 +456,6 @@ class AgentLoopOutput(BaseModel):
     """Number of chat turns, including user, assistant, tool."""
     metrics: AgentLoopMetrics
     """Auxiliary performance metrics"""
-    generate_finish_time: float = 0.0 
-    """LLM 生成完成的时间偏移量"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 
@@ -264,7 +485,6 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
-    generate_finish_time: float = 0.0
 
 
 class DictConfigWrap:
@@ -426,15 +646,6 @@ def register(agent_name: str):
 
     return decorator
 
-def _pick_prompt_tensor(batch):
-    # 不要猜 "prompts"，按常见键兜底
-    if "input_ids" in batch:
-        return batch["input_ids"]
-    if "prompt_ids" in batch:
-        return batch["prompt_ids"]
-    if "prompt_token_ids" in batch:
-        return batch["prompt_token_ids"]
-    raise KeyError(f"no prompt ids key, keys={list(batch.keys())}")
 
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
@@ -452,7 +663,6 @@ class AgentLoopWorker:
             reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
         """
         self.config = config
-        self.server_handles = server_handles
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
@@ -496,21 +706,9 @@ class AgentLoopWorker:
 
         Returns:
             DataProto: Output batch.
-            - prompts: [bsz, prompt_length], prompt token ids from dataset.
-            - responses: [bsz, response_length], output token ids include response tokens
-              from LLM generation and observation tokens from tool_calls.
-            - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
-            - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
-              and response tokens.
-            - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
-            - position_ids: [bsz, prompt_length + response_length], incremental position ids.
-
-            For multi-turn conversations:
-            responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
-            response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
 
-        # print("[debug] calling sequences in async + tool call")
+        print("[debug] calling sequences in async + tool call")
 
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
@@ -540,7 +738,6 @@ class AgentLoopWorker:
         max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
-        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
         if max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
             if max_samples_per_worker < len(unique_sample_indices):
@@ -610,27 +807,6 @@ class AgentLoopWorker:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
-        # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
-
-        # NOTE: consistent with the legacy batch version of generate_sequences that existed in the
-        # deprecated vLLM SPMD rollout implementation.
-        # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
-        # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
-        # input_ids: concatenation of prompt + response
-        # Mask:
-        # For example, if the prompt is [1,2,3,4] and the response is [5,6,7,(tool start)8,9(tool end),10,11,12]
-        # - prompt_attention_mask: 0s for padding, 1s for tokens
-        #   e.g., [0,0,0,0,1,1,1,1]
-        # - response_attention_mask: 0s for padding, 1s for tokens
-        #   e.g., [1,1,1,1,1,1,1,1,1,1,1,0,0,0,0]
-        # attention_mask: concatenation of prompt_attention_mask and response_attention_mask
-        #   e.g., [0,0,0,0,1,1,1,1(prompt),1,1,1,1,1,1,1,1,1,1,1,0,0,0,0(response)]
-        # - response_mask: 1s for LLM generated tokens, 0 for tool response/padding tokens
-        #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
-        # - position_ids: sequential positions for tokens, starting at 0
-        #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
-
-        # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
@@ -686,11 +862,9 @@ class AgentLoopWorker:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
-            # Calculate start position: left padding means original prompt starts at the end
             start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
             end_pos = min(start_pos + length, total_length)
 
-            # Add boundary checks for robustness
             if start_pos < 0 or end_pos > total_length:
                 raise ValueError(
                     f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
@@ -724,7 +898,6 @@ class AgentLoopWorker:
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
-            generate_finish_time=output.generate_finish_time, # 传递时间戳
             extra_fields=output.extra_fields,
         )
 
@@ -736,7 +909,6 @@ class AgentLoopWorker:
 
         images = output.multi_modal_data.get("images")
         videos = output.multi_modal_data.get("videos")
-        # split the videos and according metadatas
         if videos is not None:
             videos, video_metadatas = zip(*videos, strict=False)
             videos, video_metadatas = list(videos), list(video_metadatas)
@@ -754,8 +926,6 @@ class AgentLoopWorker:
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)
 
-        # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-        # because np.array() only keeps the keys for BatchFeature.
         multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         if image_grid_thw is not None:
@@ -766,25 +936,24 @@ class AgentLoopWorker:
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
         if self.processor is None:
-            return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+            return compute_position_id_with_mask(attention_mask)
 
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         video_grid_thw = multi_modal_inputs.get("video_grid_thw")
 
-        # Model's get_rope_index has been dynamically bind to the processor.
         vision_position_ids, _ = self.processor.get_rope_index(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
         )
-        vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
+        vision_position_ids = vision_position_ids.transpose(0, 1)
 
         valid_mask = attention_mask[0].bool()
         text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
         text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
         text_position_ids = text_position_ids.unsqueeze(0)
-        position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
+        position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)
         return position_ids
 
     async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
@@ -794,10 +963,10 @@ class AgentLoopWorker:
         if output.reward_score is None and enable_async_reward:
             batch = TensorDict(
                 {
-                    "prompts": prompts,  # [1, prompt_length]
-                    "responses": responses,  # [1, response_length]
-                    "attention_mask": attention_mask,  # [1, prompt_length + response_length]
-                    "input_ids": input_ids,  # [1, prompt_length + response_length]
+                    "prompts": prompts,
+                    "responses": responses,
+                    "attention_mask": attention_mask,
+                    "input_ids": input_ids,
                     "position_ids": position_ids,
                 },
                 batch_size=1,
@@ -819,7 +988,6 @@ class AgentLoopWorker:
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
-        # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
         response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
@@ -827,8 +995,6 @@ class AgentLoopWorker:
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
-        # 统计每个样本的实际生成长度（排除 padding）
-        generated_lens = torch.tensor([input.response_mask.sum().item() for input in inputs], dtype=torch.int32)
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
@@ -836,14 +1002,11 @@ class AgentLoopWorker:
 
         batch = TensorDict(
             {
-                "prompts": prompt_ids,  # [bsz, prompt_length]
-                "responses": response_ids,  # [bsz, response_length]
-                "response_mask": response_mask,  # [bsz, response_length]
-                "finish_times": torch.tensor([input.generate_finish_time for input in inputs], dtype=torch.float32),
-                "generated_lens": generated_lens,
-                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
-                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
-                # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
+                "prompts": prompt_ids,
+                "responses": response_ids,
+                "response_mask": response_mask,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "position_ids": position_ids,
                 **optional_outputs,
             },
@@ -862,19 +1025,16 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
 
-        # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
-        # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
         if any(mmi is not None for mmi in multi_modal_inputs_list):
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
-        # Collect extra fields from all inputs and convert them to np.ndarray
         extra_fields = {}
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields)
         for key in all_keys:
@@ -884,8 +1044,6 @@ class AgentLoopWorker:
 
         non_tensor_batch.update(extra_fields)
 
-        # Only include reward_extra_keys in meta_info if rm_scores is in batch
-        # This avoids conflicts when reward_tensor is merged later in ray_trainer.py
         if "rm_scores" in batch.keys():
             meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
         else:
@@ -911,73 +1069,9 @@ class AgentLoopWorker:
             config=self.config.transfer_queue,
         )
 
-    def start_generate_stream_batch(self, gen_batch, replica: int = 0, **kw):
-        print(f"[worker] start_generate_stream_batch replica={replica}", flush=True)
-
-        prompts = _pick_prompt_tensor(gen_batch.batch)
-        attn = gen_batch.batch.get("attention_mask", None)
-
-        # sampling_params：沿用你 generate_sequences 那套（这里直接从 meta_info 取温度等）
-        temperature = float(gen_batch.meta_info.get("temperature", 1.0))
-        top_p = float(gen_batch.meta_info.get("top_p", 1.0))
-        top_k = int(gen_batch.meta_info.get("top_k", -1))
-        max_tokens = int(gen_batch.meta_info.get("max_tokens", gen_batch.meta_info.get("response_length", 1024)))
-        logprobs = bool(gen_batch.meta_info.get("logprobs", False))
-
-        sampling_params = {
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "max_tokens": max_tokens,
-            "logprobs": logprobs,
-        }
-
-        server = self.server_handles[replica]
-
-        handles = []
-        request_ids = []
-
-        n = int(prompts.shape[0])
-        for i in range(n):
-            ids = prompts[i].tolist()
-
-            # trim padding by attention_mask
-            if attn is not None:
-                valid_len = int(attn[i].sum().item())
-                if valid_len > 0:
-                    ids = ids[-valid_len:]
-            else:
-                while len(ids) > 0 and ids[0] == 0:
-                    ids = ids[1:]
-
-            rid = uuid4().hex
-            ret = ray.get(server.start_generate_stream.remote(
-                prompt_ids=ids,
-                sampling_params=sampling_params,
-                request_id=rid,
-                **kw,
-            ))
-            handles.append(ret["handle"])
-            request_ids.append(rid)
-
-            if i < 3:
-                print(f"[worker] start #{i} rid={rid} handle={ret['handle']} prompt_len={ret.get('prompt_len')}", flush=True)
-
-        print(f"[worker] started {len(handles)} streams", flush=True)
-        return {"handles": handles, "request_ids": request_ids, "sampling_params": sampling_params}
-
 
 async def get_trajectory_info(step, index, validate):
-    """Get trajectory info.
-
-    Args:
-        step (int): global steps in the trainer.
-        index (list): form datastore extra_info.index column.
-        validate (bool): whether is a validate step.
-
-    Returns:
-        list: trajectory.
-    """
+    """Get trajectory info."""
     trajectory_info = []
     rollout_n = 0
     for i in range(len(index)):
@@ -999,19 +1093,11 @@ class AgentLoopManager:
         rollout_resource_pool: RayResourcePool = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
-        """Initialize agent loop manager.
-
-        Args:
-            config (DictConfig): trainer config.
-            worker_group (RayWorkerGroup): ActorRolloutRef worker group for hybrid mode; None for standalone mode.
-            rollout_resource_pool (RayResourcePool): Resource pool for actor rollout (Colocate or Standalone mode).
-            reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
-        """
+        """Initialize agent loop manager."""
         self.config = config
         self.worker_group = worker_group
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
-        # for recipe to change
         if not hasattr(self, "rollout_replica_class"):
             self.rollout_replica_class = get_rollout_replica_class(self.config.actor_rollout_ref.rollout.name)
         if not hasattr(self, "agent_loop_workers_class"):
@@ -1062,7 +1148,6 @@ class AgentLoopManager:
 
         print(f"AgentLoopManager: {self.server_addresses}")
 
-        # Update Prometheus configuration with server addresses
         if rollout_config.prometheus.enable:
             if rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
@@ -1074,7 +1159,6 @@ class AgentLoopManager:
 
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         for i in range(num_workers):
-            # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
             self.agent_loop_workers.append(
                 self.agent_loop_workers_class.options(
@@ -1087,10 +1171,8 @@ class AgentLoopManager:
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers."""
-        # print("[debug] Calling generate sequences batched")
+        print("[debug] Calling generate sequences batched")
 
-        
-        #  分块并分发给各 AgentLoopWorker
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
@@ -1098,119 +1180,90 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
-        
-        # 3. 合并所有 Worker 返回的数据
         output = DataProto.concat(outputs)
 
-        # --- 核心改进：统计有效并行度 (BS) 与总有效序列长度 (SeqLen) ---
-        if 'finish_times' in output.batch.keys() and 'generated_lens' in output.batch.keys():
-            finish_times = output.batch['finish_times'].cpu().numpy()
-            generated_lens = output.batch['generated_lens'].cpu().numpy()
-            
-            sort_idx = np.argsort(finish_times)
-            sorted_times = finish_times[sort_idx]
-            sorted_lens = generated_lens[sort_idx]
-            
-            total_n = len(sorted_times)
-            total_seq_len = np.sum(generated_lens)
-            
-            effective_bs_trace = []
-            effective_seq_len_trace = []
-            
-            current_active_n = total_n
-            current_active_seq_len = float(total_seq_len)
-            
-            # 初始状态：t=0
-            effective_bs_trace.append([0.0, current_active_n])
-            effective_seq_len_trace.append([0.0, current_active_seq_len])
-            
-            for i in range(total_n):
-                t = float(sorted_times[i])
-                sample_len = float(sorted_lens[i])
-                
-                # 记录下降前的点
-                effective_bs_trace.append([t, current_active_n])
-                effective_seq_len_trace.append([t, current_active_seq_len])
-                
-                # 样本完成，更新数值
-                current_active_n -= 1
-                current_active_seq_len -= sample_len
-                
-                # 记录下降后的点
-                effective_bs_trace.append([t, current_active_n])
-                effective_seq_len_trace.append([t, current_active_seq_len])
-            
-            # 将轨迹存入 meta_info
-            output.meta_info['effective_bs_trace'] = effective_bs_trace
-            output.meta_info['effective_seq_len_trace'] = effective_seq_len_trace
+        metrics = [output.meta_info.pop("metrics") for output in outputs]
+        timing = self._performance_metrics(metrics, output)
 
-        # 4. 原有的性能指标处理逻辑
-        # 注意：这里统一使用 outputs 获取 metrics
-        metrics_list = [out.meta_info.pop("metrics") for out in outputs]
-        timing = self._performance_metrics(metrics_list, output)
-
-        # 5. 更新 meta_info 并返回
-        output.meta_info.update({
-            "timing": timing, 
-            **outputs[0].meta_info 
-        })
-        
+        output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
-        
-
-    def start_generate_stream(self, gen_batch=None, *, prompt_ids=None, sampling_params=None, request_id=None, replica=0, **kw):
-        # mode A: batch (DataProto) -> go through AgentLoopWorker to avoid you手动拆字段
-        if gen_batch is not None:
-            # print(f"[mgr] start_generate_stream(batch) replica={replica}", flush=True)
-            # 走 worker，worker 里批量 start（下面第2步你要加 worker 方法）
-            ref = self.agent_loop_workers[0].start_generate_stream_batch.remote(gen_batch, replica, **kw)
-            return ray.get(ref)
-
-        # mode B: single request
-        assert prompt_ids is not None and sampling_params is not None, "need gen_batch or (prompt_ids,sampling_params)"
-        request_id = request_id or uuid4().hex
-        # print(f"[mgr] start_generate_stream(single) replica={replica} rid={request_id}", flush=True)
-        # DEBUG: print what server handle actually is
-        info = ray.get(self.server_handles[replica].__ray_call__.remote(
-            lambda self: {
-                "type": type(self).__name__,
-                "has_start_generate_stream": hasattr(self, "start_generate_stream"),
-                "has_poll_generate_stream": hasattr(self, "poll_generate_stream"),
-                "has_finalize_generate_stream": hasattr(self, "finalize_generate_stream"),
-                "dir_stream": [x for x in dir(self) if "stream" in x],
-            }
-        ))
-        # print(f"[DEBUG] server_handles[{replica}] -> {info}", flush=True)
-        ref = self.server_handles[replica].start_generate_stream.remote(
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            **kw,
-        )
-        return ray.get(ref)
-
-    def poll_generate_stream_many(self, handles, timeout_ms: int = 5, replica: int = 0):
-        return ray.get(self.server_handles[replica].poll_generate_stream_many.remote(handles, timeout_ms))
-
-    def get_generate_stream_status_many(self, handles, replica: int = 0):
-        return ray.get(self.server_handles[replica].get_generate_stream_status_many.remote(handles))
-
-    def register_generate_stream_group(self, handles, replica: int = 0):
-        return ray.get(self.server_handles[replica].register_generate_stream_group.remote(handles))
-
-    def get_generate_stream_group_status(self, group_id, replica: int = 0):
-        return ray.get(self.server_handles[replica].get_generate_stream_group_status.remote(group_id))
-
-    def clear_generate_stream_group(self, group_id, replica: int = 0):
-        return ray.get(self.server_handles[replica].clear_generate_stream_group.remote(group_id))
-
-    def finalize_generate_stream(self, handle, replica: int = 0):
-        return ray.get(self.server_handles[replica].finalize_generate_stream.remote(handle))
-
-    def cancel_generate_stream(self, handle, replica: int = 0):
-        return ray.get(self.server_handles[replica].cancel_generate_stream.remote(handle))
 
     # =========================================================================
+    # [Added for Overlap Decode] Manual Control Interface
+    # 这些是新加的方法，用于支持 fit_overlap_decode
+    # =========================================================================
+
+    async def add_requests(self, prompts: DataProto) -> List[str]:
+        """
+        [Sync-API] 发送 Prompts 到 Server，但不开始生成。
+        """
+        bsz = prompts.batch["prompts"].shape[0]
+        request_ids = [uuid4().hex for _ in range(bsz)]
+
+        prompt_ids_batch = []
+        prompts_tensor = prompts.batch["prompts"]
+        attn = prompts.batch.get("attention_mask", None)
+
+        for i in range(bsz):
+            ids = prompts_tensor[i].tolist()
+            if attn is not None:
+                cur_attn = attn[i]
+                if cur_attn.size(0) >= len(ids):
+                    cur_attn = cur_attn[: len(ids)]
+                valid_len = int(cur_attn.sum().item())
+                if valid_len > 0:
+                    ids = ids[-valid_len:]
+                else:
+                    while len(ids) > 0 and ids[0] == 0:
+                        ids = ids[1:]
+            else:
+                while len(ids) > 0 and ids[0] == 0:
+                    ids = ids[1:]
+            prompt_ids_batch.append(ids)
+
+        meta_params = prompts.meta_info.get("sampling_params", {})
+        default_max_tokens = getattr(self.config, "response_length", 1024) if hasattr(self, "config") else 1024
+
+        sampling_params = {
+            "temperature": meta_params.get("temperature", 1.0),
+            "top_p": meta_params.get("top_p", 1.0),
+            "top_k": meta_params.get("top_k", -1),
+            "max_tokens": meta_params.get("max_tokens", default_max_tokens),
+            "logprobs": meta_params.get("logprobs", 1),
+            "ignore_eos": meta_params.get("ignore_eos", False),
+        }
+
+        payload = {
+            "request_ids": request_ids,
+            "prompt_ids_batch": prompt_ids_batch,
+            "sampling_params": sampling_params,
+        }
+
+        target_server = self.server_handles[0]
+        await target_server.collective_rpc.remote("add_requests", args=(payload,))
+
+        return request_ids
+
+    async def step(self, max_steps: int = 1) -> None:
+        """
+        [Sync-API] 驱动 Server 往前推理 max_steps 步。
+        """
+        target_server = self.server_handles[0]
+        await target_server.collective_rpc.remote("step", kwargs={"max_steps": max_steps})
+
+    async def collect(self, request_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        [Sync-API] 收集指定 Request ID 的最新输出。
+        """
+        if not request_ids:
+            return []
+
+        target_server = self.server_handles[0]
+        results = await target_server.collective_rpc.remote("collect", args=(request_ids,))
+        return results if results is not None else []
+
+    # =========================================================================
+
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
@@ -1226,7 +1279,6 @@ class AgentLoopManager:
         timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
 
-        # batch sequence generation is bounded by the slowest sample
         slowest = np.argmax(t_generate_sequences + t_tool_calls)
         attention_mask = output.batch["attention_mask"][slowest]
         prompt_length = output.batch["prompts"].shape[1]

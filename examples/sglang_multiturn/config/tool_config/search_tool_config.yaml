@@ -2,6 +2,27 @@ tools:
   - class_name: verl.tools.search_tool.SearchTool
     config:
       retrieval_service_url: http://127.0.0.1:8000/retrieve
+      # Sync trainer uses this local retriever directly in the driver process.
+      # Prepare files with:
+      #   python examples/sglang_multiturn/search_r1_like/local_dense_retriever/download.py --save_path /home/zhengding/data/search_r1_retriever
+      #   cat /home/zhengding/data/search_r1_retriever/part_* > /home/zhengding/data/search_r1_retriever/e5_Flat.index
+      #   gzip -d /home/zhengding/data/search_r1_retriever/wiki-18.jsonl.gz
+      local_retriever:
+        retrieval_method: e5
+        index_path: /data/prabhleen-data/e5_Flat.index
+        # Local JSONL file:
+        # corpus_path: /home/zhengding/data/search_r1_retriever/wiki-18.jsonl
+        # Or HuggingFace dataset (auto-detect when path is not a local file):
+        corpus_path: Tevatron/msmarco-passage-corpus
+        corpus_source: huggingface   # optional, auto-detect if omitted
+        corpus_split: train          # optional, default "train"
+        retrieval_model_path: intfloat/e5-large-v2
+        retrieval_topk: 3
+        retrieval_pooling_method: mean
+        retrieval_query_max_length: 256
+        retrieval_batch_size: 512
+        retrieval_use_fp16: true
+        faiss_gpu: false
       num_workers: 120
       rate_limit: 120
       timeout: 90

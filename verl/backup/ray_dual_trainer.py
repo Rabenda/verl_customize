@@ -1114,44 +1114,6 @@ class DualRayPPOTrainer:
         return metric_dict
 
     # -------------------------
-    # Debug: print longest response in a batch (after rollout) for comparing generate length
-    # -------------------------
-    def _print_longest_response(
-        self, label: str, data: DataProto, step: int, head_tokens: int = 20, tail_tokens: int = 20
-    ):
-        """Print the longest response in data (by response_mask), truncated to head+tail for readability."""
-        batch = data.batch
-        if "responses" not in batch:
-            print(f"[LONGEST_RESP] {label} step={step} (no 'responses' in batch, keys={list(batch.keys())})", flush=True)
-            return
-        responses = batch["responses"]
-        response_mask = batch.get("response_mask")
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        if response_mask is None:
-            response_mask = (responses != pad_id).long()
-        lengths = response_mask.sum(dim=1)
-        if lengths.max().item() == 0:
-            print(f"[LONGEST_RESP] {label} step={step} response_len=0 (all empty)", flush=True)
-            return
-        idx = lengths.argmax().item()
-        len_i = int(lengths[idx].item())
-        row = responses[idx]
-        ids = row[response_mask[idx].bool()].tolist()
-        if not ids:
-            ids = row[:len_i].tolist()
-        if len(ids) <= head_tokens + tail_tokens:
-            text = self.tokenizer.decode(ids, skip_special_tokens=True)
-        else:
-            head_ids = ids[:head_tokens]
-            tail_ids = ids[-tail_tokens:]
-            head_text = self.tokenizer.decode(head_ids, skip_special_tokens=True)
-            tail_text = self.tokenizer.decode(tail_ids, skip_special_tokens=True)
-            text = f"{head_text}\n... [truncated, {len(ids) - head_tokens - tail_tokens} tokens] ...\n{tail_text}"
-        print(f"[LONGEST_RESP] {label} step={step} response_len={len_i} idx={idx}", flush=True)
-        print(f"[LONGEST_RESP] {label} step={step} text:\n{text}", flush=True)
-        print(f"[LONGEST_RESP] {label} step={step} --- end ---", flush=True)
-
-    # -------------------------
     # One actor step
     # -------------------------
     def _step_one_actor(self, which: str, batch: DataProto, timing_raw: dict, metrics: dict, gen_batch_output_override: Optional[DataProto] = None):
@@ -1168,14 +1130,12 @@ class DualRayPPOTrainer:
             gen_batch_output = gen_batch.repeat(repeat_times=actor_cfg.rollout.n, interleave=True)
 
             with marked_timer(f"gen_{which}", timing_raw, color="red"):
-                t_rollout_start = time.perf_counter()
                 gen_batch_output = async_mgr.generate_sequences(gen_batch_output)
-                t_rollout_end = time.perf_counter()
                 ckpt_mgr.sleep_replicas()
                 timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                 gen_batch_output.meta_info.pop("timing", None)
 
-            print(f"[ROLLOUT] wall_time={t_rollout_end - t_rollout_start:.3f}s which={which} step={self.global_steps}", flush=True)
+            rtprint(f"[rt] step={self.global_steps} gen_{which} done: {timing_raw.get(f'gen_{which}', float('nan')):.2f}s")
         else:
             t0 = time.time()
             gen_batch_output = gen_batch_output_override
@@ -1351,8 +1311,6 @@ class DualRayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
-        fit_wall_start = time.perf_counter()
-        print(f"[FIT_DUAL] wall_start={_ts()}", flush=True)
 
         self.global_steps = 0
         self._load_checkpoint()
@@ -1402,18 +1360,8 @@ class DualRayPPOTrainer:
 
                 with marked_timer("step", timing_raw):
                     batch_a, batch_b = DataProto.from_single_dict_two_copies(batch_dict)
-                    t_rollout_a0 = time.perf_counter()
-                    print(f"[FIT] rollout_a walltime_before={t_rollout_a0:.6f} step={self.global_steps}", flush=True)
                     batch_a, _ = self._step_one_actor("a", batch_a, timing_raw, metrics)
-                    t_rollout_a1 = time.perf_counter()
-                    print(f"[FIT] rollout_a walltime_after={t_rollout_a1:.6f} duration={t_rollout_a1 - t_rollout_a0:.3f}s step={self.global_steps}", flush=True)
-                    self._print_longest_response("FIT_rollout_a", batch_a, self.global_steps)
-                    t_rollout_b0 = time.perf_counter()
-                    print(f"[FIT] rollout_b walltime_before={t_rollout_b0:.6f} step={self.global_steps}", flush=True)
                     batch_b, _ = self._step_one_actor("b", batch_b, timing_raw, metrics)
-                    t_rollout_b1 = time.perf_counter()
-                    print(f"[FIT] rollout_b walltime_after={t_rollout_b1:.6f} duration={t_rollout_b1 - t_rollout_b0:.3f}s step={self.global_steps}", flush=True)
-                    self._print_longest_response("FIT_rollout_b", batch_b, self.global_steps)
 
                     if self.use_critic:
                         with marked_timer("update_critic_a", timing_raw, color="pink"):
@@ -1490,9 +1438,7 @@ class DualRayPPOTrainer:
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
-                    print(f"[FIT_DUAL] wall_total={time.perf_counter() - fit_wall_start:.3f}s (completed)", flush=True)
                     return
-        print(f"[FIT_DUAL] wall_total={time.perf_counter() - fit_wall_start:.3f}s (epoch_end)", flush=True)
 
     def fit_naive_concurrent_rollout(self):
         from verl.utils.tracking import Tracking
@@ -1583,7 +1529,7 @@ class DualRayPPOTrainer:
                     t_gen1 = time.time()
 
                     timing_raw["gen_parallel_wall"] = t_gen1 - t_gen0
-                    print(f"[ROLLOUT] wall_time={t_gen1 - t_gen0:.3f}s (a+b parallel) step={self.global_steps}", flush=True)
+                    rtprint(f"[rt] step={self.global_steps} gen_parallel_wall={timing_raw['gen_parallel_wall']:.2f}s")
 
                     # 把 vLLM timing 合进 timing_raw（否则你后面看不到 engine 内部细分）
                     timing_raw.update(gen_out_a.meta_info.get("timing", {}))
@@ -1792,7 +1738,7 @@ class DualRayPPOTrainer:
         # ----------------------------
         # helper: build DataProto from token buffers
         # ----------------------------
-        def _build_output(gen_in, prompt_ids_by_handle, result_by_handle, handles, prompt_length, response_length):
+        def _build_output(gen_in, prompt_ids_by_handle, tokbuf, handles, prompt_length, response_length):
             print("[BUILD] assembling DataProto", flush=True)
             bsz = len(handles)
             prompt_len = int(prompt_length)
@@ -1811,7 +1757,7 @@ class DualRayPPOTrainer:
                     prompts[i, prompt_len - lp : prompt_len] = torch.tensor(pids, dtype=torch.long)
                     prompt_attn[i, prompt_len - lp : prompt_len] = 1
 
-                toks = result_by_handle.get(h, {}).get("output_token_ids", [])
+                toks = tokbuf.get(h, [])
                 L = min(len(toks), response_length)
                 if L > 0:
                     resp[i, :L] = torch.tensor(toks[:L], dtype=torch.long)
@@ -1872,9 +1818,10 @@ class DualRayPPOTrainer:
                 print(f"[{_ts()}] [A] starting streaming...", flush=True)
                 t_rollout_a_wall0 = time.perf_counter()
                 t_a_start = time.perf_counter()
+                t_a_start_wall = time.time()
 
                 handles_a = []
-                result_meta_a = {}
+                tokbuf_a = {}
                 prompt_ids_a_by_handle = {}
                 for i in range(len(gen_a)):
                     ids = _get_prompt_ids(gen_a, i)
@@ -1885,51 +1832,72 @@ class DualRayPPOTrainer:
                         prompt_ids=ids,
                         sampling_params=sampling_a,
                         request_id=rid,
-                        emit_token_deltas=False,
                     )
                     h = ret["handle"]
                     handles_a.append(h)
+                    tokbuf_a[h] = []
                     prompt_ids_a_by_handle[h] = ids
 
-                active_a_count = len(handles_a)
-                group_a = mgr_a.register_generate_stream_group(handles_a)["group_id"]
-                print(f"[{_ts()}] [A] started {active_a_count} streams", flush=True)
+                active_a = set(handles_a)
+                print(f"[{_ts()}] [A] started {len(active_a)} streams", flush=True)
 
                 started_b = False
-                active_b_count = 0
-                group_b = None
-                result_meta_b = {}
+                active_b = set()
+                tokbuf_b = {}
                 handles_b = []
                 prompt_ids_b_by_handle = {}
                 t_b_trigger = None
                 t_b_start = None
+                t_b_start_wall = None
                 t_a_done = None
                 t_b_done = None
                 _hl_threshold = 128
                 high_low_a = {"triggered": False, "start_ts": None, "elapsed_s": None}
                 high_low_b = {"triggered": False, "start_ts": None, "elapsed_s": None}
+                first_token_ts_a = {}
+                first_token_ts_b = {}
+                server_prefill_a = {}
+                server_prefill_b = {}
 
                 poll_iter = 0
 
-                # ---------- status loop ----------
-                print(f"[{_ts()}] [STATUS] enter polling loop", flush=True)
+                # ---------- poll loop ----------
+                print(f"[{_ts()}] [POLL] enter polling loop", flush=True)
 
                 while True:
                     poll_iter += 1
 
-                    if active_a_count > 0:
-                        group_status_a = mgr_a.get_generate_stream_group_status(group_a)
-                        active_a_count = int(group_status_a.get("active_count", active_a_count))
-                        if active_a_count == 0 and t_a_done is None:
-                            t_a_done = time.perf_counter()
-                            print(f"[ROLLOUT] wall_time={t_a_done - t_rollout_a_wall0:.3f}s which=a step={self.global_steps}", flush=True)
+                    if active_a:
+                        poll_a = mgr_a.poll_generate_stream_many(list(active_a), timeout_ms=poll_timeout_ms)
+                        if poll_a:
+                            for item in poll_a:
+                                h = item["handle"]
+                                ev = item.get("event", item)
+                                typ = ev.get("type")
 
-                    if (not started_b) and (active_a_count <= start_b_when_active_a_leq):
-                        print(f"[{_ts()}] [TRIGGER] start B (active_a={active_a_count})", flush=True)
+                                if typ == "delta":
+                                    if h not in first_token_ts_a:
+                                        first_token_ts_a[h] = time.perf_counter()
+                                        mi = ev.get("meta_info", {})
+                                        server_prefill_a[h] = {
+                                            "queue_time": mi.get("queue_time"),
+                                            "prefill_launch_delay": mi.get("prefill_launch_delay"),
+                                            "prefill_launch_latency": mi.get("prefill_launch_latency"),
+                                            "prefill_finished_ts": mi.get("prefill_finished_ts"),
+                                        }
+                                    tokbuf_a[h].extend(ev.get("token_ids", []))
+                                elif typ in ("done", "error"):
+                                    active_a.discard(h)
+                                    if not active_a and t_a_done is None:
+                                        t_a_done = time.perf_counter()
+
+                    if (not started_b) and (len(active_a) <= start_b_when_active_a_leq):
+                        print(f"[{_ts()}] [TRIGGER] start B (active_a={len(active_a)})", flush=True)
                         started_b = True
                         t_rollout_b_wall0 = time.perf_counter()
                         t_b_trigger = time.perf_counter()
                         t_b_start = t_b_trigger
+                        t_b_start_wall = time.time()
 
                         for i in range(len(gen_b)):
                             ids = _get_prompt_ids(gen_b, i)
@@ -1940,54 +1908,74 @@ class DualRayPPOTrainer:
                                 prompt_ids=ids,
                                 sampling_params=sampling_b,
                                 request_id=rid,
-                                emit_token_deltas=False,
                             )
                             h = ret["handle"]
                             handles_b.append(h)
+                            tokbuf_b[h] = []
                             prompt_ids_b_by_handle[h] = ids
 
-                        active_b_count = len(handles_b)
-                        group_b = mgr_b.register_generate_stream_group(handles_b)["group_id"]
-                        print(f"[{_ts()}] [B] started {active_b_count} streams", flush=True)
+                        active_b = set(handles_b)
+                        print(f"[{_ts()}] [B] started {len(active_b)} streams", flush=True)
 
-                    if started_b and active_b_count > 0:
-                        group_status_b = mgr_b.get_generate_stream_group_status(group_b)
-                        active_b_count = int(group_status_b.get("active_count", active_b_count))
-                        if active_b_count == 0 and t_b_done is None:
-                            t_b_done = time.perf_counter()
-                            print(f"[ROLLOUT] wall_time={t_b_done - t_rollout_b_wall0:.3f}s which=b step={self.global_steps}", flush=True)
+                    if started_b and active_b:
+                        poll_b = mgr_b.poll_generate_stream_many(list(active_b), timeout_ms=poll_timeout_ms)
+                        if poll_b:
+                            for item in poll_b:
+                                h = item["handle"]
+                                ev = item.get("event", item)
+                                typ = ev.get("type")
+                                if typ == "delta":
+                                    if h not in first_token_ts_b:
+                                        first_token_ts_b[h] = time.perf_counter()
+                                        mi = ev.get("meta_info", {})
+                                        server_prefill_b[h] = {
+                                            "queue_time": mi.get("queue_time"),
+                                            "prefill_launch_delay": mi.get("prefill_launch_delay"),
+                                            "prefill_launch_latency": mi.get("prefill_launch_latency"),
+                                            "prefill_finished_ts": mi.get("prefill_finished_ts"),
+                                        }
+                                    tokbuf_b[h].extend(ev.get("token_ids", []))
+                                elif typ in ("done", "error"):
+                                    active_b.discard(h)
+                                    if not active_b and t_b_done is None:
+                                        t_b_done = time.perf_counter()
 
-                    if not high_low_a["triggered"] and 0 < active_a_count < _hl_threshold:
+                    if not high_low_a["triggered"] and 0 < len(active_a) < _hl_threshold:
                         high_low_a["triggered"] = True
                         high_low_a["start_ts"] = time.perf_counter()
-                    if not high_low_b["triggered"] and started_b and 0 < active_b_count < _hl_threshold:
+                    if not high_low_b["triggered"] and started_b and 0 < len(active_b) < _hl_threshold:
                         high_low_b["triggered"] = True
                         high_low_b["start_ts"] = time.perf_counter()
 
                     if poll_iter % 50 == 0:
                         print(
-                            f"[{_ts()}] [STATUS] iter={poll_iter} active_a={active_a_count} active_b={active_b_count}",
+                            f"[{_ts()}] [POLL] iter={poll_iter} active_a={len(active_a)} active_b={len(active_b)}",
                             flush=True,
                         )
 
-                    if active_a_count == 0 and (not started_b or active_b_count == 0):
-                        print(f"[{_ts()}] [STATUS] exit loop", flush=True)
+                    if not active_a and (not started_b or not active_b):
+                        print(f"[{_ts()}] [POLL] exit loop", flush=True)
                         break
-
-                    time.sleep(max(float(poll_timeout_ms) / 1000.0, 0.001))
 
                 # ---------- finalize ----------
                 print(f"[{_ts()}] [FINALIZE] A", flush=True)
                 for h in handles_a:
-                    result_meta_a[h] = mgr_a.finalize_generate_stream(h)
-                mgr_a.clear_generate_stream_group(group_a)
+                    mgr_a.finalize_generate_stream(h)
+                t_rollout_a_wall1 = time.perf_counter()
+                print(
+                    f"[{_ts()}] [WALL] rollout_a_total={t_rollout_a_wall1 - t_rollout_a_wall0:.3f}s",
+                    flush=True,
+                )
 
                 if started_b:
                     print(f"[{_ts()}] [FINALIZE] B", flush=True)
                     for h in handles_b:
-                        result_meta_b[h] = mgr_b.finalize_generate_stream(h)
-                    if group_b is not None:
-                        mgr_b.clear_generate_stream_group(group_b)
+                        mgr_b.finalize_generate_stream(h)
+                    t_rollout_b_wall1 = time.perf_counter()
+                    print(
+                        f"[{_ts()}] [WALL] rollout_b_total={t_rollout_b_wall1 - t_rollout_b_wall0:.3f}s",
+                        flush=True,
+                    )
                 for _label, _hl, _t_done in [("A", high_low_a, t_a_done), ("B", high_low_b, t_b_done)]:
                     if _hl["triggered"] and _hl["start_ts"] is not None:
                         _hl["elapsed_s"] = (_t_done if _t_done else time.perf_counter()) - _hl["start_ts"]
@@ -2000,25 +1988,64 @@ class DualRayPPOTrainer:
                 def _fmt_sec(v):
                     return f"{v:.3f}s" if v is not None else "NA"
 
+                def _ttft_stats(first_ts_dict, submit_ts):
+                    if not first_ts_dict or submit_ts is None:
+                        return None, None, None, None
+                    latencies = sorted(v - submit_ts for v in first_ts_dict.values())
+                    avg = sum(latencies) / len(latencies)
+                    p50 = latencies[len(latencies) // 2]
+                    return latencies[0], latencies[-1], avg, p50
+
+                def _server_prefill_stats(sp_dict, key):
+                    vals = [d[key] for d in sp_dict.values() if d.get(key) is not None]
+                    if not vals:
+                        return None, None, None, None
+                    vals.sort()
+                    avg = sum(vals) / len(vals)
+                    p50 = vals[len(vals) // 2]
+                    return vals[0], vals[-1], avg, p50
+
                 def _dist_fmt(mn, mx, avg, p50):
                     if mn is None:
                         return "NA"
                     return f"min={mn:.3f}s max={mx:.3f}s avg={avg:.3f}s p50={p50:.3f}s"
 
-                ttft_a = (None, None, None, None)
-                ttft_b = (None, None, None, None)
-                prefill_phase_a = None
-                prefill_phase_b = None
-                print(f"[{_ts()}] [TTFT_A] n=0 {_dist_fmt(*ttft_a)}", flush=True)
-                print(f"[{_ts()}] [TTFT_B] n=0 {_dist_fmt(*ttft_b)}", flush=True)
-                print(f"[{_ts()}] [SERVER_PREFILL_A] n=0 prefill_phase=NA prefill_compute=NA queue_time=NA launch_delay=NA", flush=True)
-                print(f"[{_ts()}] [SERVER_PREFILL_B] n=0 prefill_phase=NA prefill_compute=NA queue_time=NA launch_delay=NA", flush=True)
+                ttft_a = _ttft_stats(first_token_ts_a, t_a_start)
+                ttft_b = _ttft_stats(first_token_ts_b, t_b_start)
+                print(f"[{_ts()}] [TTFT_A] n={len(first_token_ts_a)} {_dist_fmt(*ttft_a)}", flush=True)
+                print(f"[{_ts()}] [TTFT_B] n={len(first_token_ts_b)} {_dist_fmt(*ttft_b)}", flush=True)
+
+                def _prefill_phase_time(sp_dict, start_wall):
+                    ts_list = [d["prefill_finished_ts"] for d in sp_dict.values()
+                               if d.get("prefill_finished_ts") is not None]
+                    if not ts_list or start_wall is None:
+                        return None
+                    return max(ts_list) - start_wall
+
+                prefill_phase_a = _prefill_phase_time(server_prefill_a, t_a_start_wall)
+                prefill_phase_b = _prefill_phase_time(server_prefill_b,
+                                                      t_b_start_wall if started_b else None)
+
+                for _label, _sp, _pf_phase in [("A", server_prefill_a, prefill_phase_a),
+                                                ("B", server_prefill_b, prefill_phase_b)]:
+                    n = len(_sp)
+                    pf_lat = _server_prefill_stats(_sp, "prefill_launch_latency")
+                    qt = _server_prefill_stats(_sp, "queue_time")
+                    pf_delay = _server_prefill_stats(_sp, "prefill_launch_delay")
+                    print(
+                        f"[{_ts()}] [SERVER_PREFILL_{_label}] n={n} "
+                        f"prefill_phase={_fmt_sec(_pf_phase)} "
+                        f"prefill_compute={_dist_fmt(*pf_lat)} "
+                        f"queue_time={_dist_fmt(*qt)} "
+                        f"launch_delay={_dist_fmt(*pf_delay)}",
+                        flush=True,
+                    )
 
                 # ---------- build outputs ----------
                 gen_out_a = _build_output(
                     gen_a,
                     prompt_ids_a_by_handle,
-                    result_meta_a,
+                    tokbuf_a,
                     handles_a,
                     int(actor_cfg_a.rollout.prompt_length),
                     int(actor_cfg_a.rollout.response_length),
@@ -2028,7 +2055,7 @@ class DualRayPPOTrainer:
                     gen_out_b = _build_output(
                         gen_b,
                         prompt_ids_b_by_handle,
-                        result_meta_b,
+                        tokbuf_b,
                         handles_b,
                         int(actor_cfg_b.rollout.prompt_length),
                         int(actor_cfg_b.rollout.response_length),
@@ -2036,9 +2063,6 @@ class DualRayPPOTrainer:
                 else:
                     print("[WARNING] B never started — fallback sync generate", flush=True)
                     gen_out_b = mgr_b.generate_sequences(gen_b)
-
-                self._print_longest_response("fit_overlap_decode_rollout_a", gen_out_a, self.global_steps)
-                self._print_longest_response("fit_overlap_decode_rollout_b", gen_out_b, self.global_steps)
 
                 print(f"[{_ts()}] [STEP] before _step_one_actor", flush=True)
                 t_train0 = time.perf_counter()
@@ -2275,8 +2299,7 @@ class DualRayPPOTrainer:
                     with marked_timer("gen_a", timing_raw):
                         gen_out_a = mgr_a.generate_sequences(gen_a)
                     t_a_roll1 = time.perf_counter()
-                    print(f"[ROLLOUT] wall_time={t_a_roll1 - t_a_roll0:.3f}s which=a step={self.global_steps}", flush=True)
-                    self._print_longest_response("fit_overlap_b_rollout_a_train_rollout_a", gen_out_a, self.global_steps)
+                    rtprint(f"[{_ts()}] [A_ROLLOUT] done {_fmt(t_a_roll1 - t_a_roll0)}")
 
                     timing_raw.update(gen_out_a.meta_info.get("timing", {}))
                     gen_out_a.meta_info.pop("timing", None)
@@ -2415,7 +2438,6 @@ class DualRayPPOTrainer:
                         int(actor_cfg_b.rollout.prompt_length),
                         int(actor_cfg_b.rollout.response_length),
                     )
-                    self._print_longest_response("fit_overlap_b_rollout_a_train_rollout_b", gen_out_b, self.global_steps)
 
                     # Overlap statistics (approximate)
                     if t_a_train_start is not None and t_a_train_end is not None:

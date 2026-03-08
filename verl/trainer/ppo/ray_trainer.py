@@ -555,6 +555,23 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _generate_rollout_batch(self, gen_batch: DataProto, *, curr_step_profile: bool = False) -> DataProto:
+        """Run one rollout generation pass.
+
+        Subclasses can override this to customize how multi-turn rollouts are executed
+        while keeping the rest of the PPO trainer unchanged.
+        """
+        if not self.async_rollout_mode:
+            return self.actor_rollout_wg.generate_sequences(gen_batch)
+
+        if curr_step_profile:
+            self.async_rollout_manager.start_profile(global_step=self.global_steps)
+        output = self.async_rollout_manager.generate_sequences(gen_batch)
+        self.checkpoint_manager.sleep_replicas()
+        if curr_step_profile:
+            self.async_rollout_manager.stop_profile()
+        return output
+
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -608,10 +625,7 @@ class RayPPOTrainer:
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             # rollout logic
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            test_output_gen_batch_padded = self._generate_rollout_batch(test_gen_batch_padded)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -1300,6 +1314,41 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    def _print_longest_response(
+        self, label: str, data: DataProto, step: int, head_tokens: int = 20, tail_tokens: int = 20
+    ):
+        """Print the longest response in data (by response_mask), truncated to head+tail for readability."""
+        batch = data.batch
+        if "responses" not in batch:
+            print(f"[LONGEST_RESP] {label} step={step} (no 'responses' in batch, keys={list(batch.keys())})", flush=True)
+            return
+        responses = batch["responses"]
+        response_mask = batch.get("response_mask")
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        if response_mask is None:
+            response_mask = (responses != pad_id).long()
+        lengths = response_mask.sum(dim=1)
+        if lengths.max().item() == 0:
+            print(f"[LONGEST_RESP] {label} step={step} response_len=0 (all empty)", flush=True)
+            return
+        idx = lengths.argmax().item()
+        len_i = int(lengths[idx].item())
+        row = responses[idx]
+        ids = row[response_mask[idx].bool()].tolist()
+        if not ids:
+            ids = row[:len_i].tolist()
+        if len(ids) <= head_tokens + tail_tokens:
+            text = self.tokenizer.decode(ids, skip_special_tokens=True)
+        else:
+            head_ids = ids[:head_tokens]
+            tail_ids = ids[-tail_tokens:]
+            head_text = self.tokenizer.decode(head_ids, skip_special_tokens=True)
+            tail_text = self.tokenizer.decode(tail_ids, skip_special_tokens=True)
+            text = f"{head_text}\n... [truncated, {len(ids) - head_tokens - tail_tokens} tokens] ...\n{tail_text}"
+        print(f"[LONGEST_RESP] {label} step={step} response_len={len_i} idx={idx}", flush=True)
+        print(f"[LONGEST_RESP] {label} step={step} text:\n{text}", flush=True)
+        print(f"[LONGEST_RESP] {label} step={step} --- end ---", flush=True)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1317,6 +1366,8 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        fit_wall_start = time.perf_counter()
+        print(f"[FIT] wall_start={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}", flush=True)
 
         self.global_steps = 0
 
@@ -1334,6 +1385,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                print(f"[FIT] wall_total={time.perf_counter() - fit_wall_start:.3f}s (val_only)", flush=True)
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
@@ -1396,25 +1448,22 @@ class RayPPOTrainer:
                         step_wall_time = time.time() - fit_start_time
                         # logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(step_wall_time * 1000))
 
-                        if not self.async_rollout_mode:
-                            # decoding
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                        else:
-                            if curr_step_profile:
-                                self.async_rollout_manager.start_profile(global_step=self.global_steps)
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                            self.checkpoint_manager.sleep_replicas()
-                            if curr_step_profile:
-                                self.async_rollout_manager.stop_profile()
+                        t_rollout_start = time.perf_counter()
+                        print(f"[ROLLOUT] walltime_before={t_rollout_start:.6f} step={self.global_steps}", flush=True)
+                        gen_batch_output = self._generate_rollout_batch(
+                            gen_batch_output, curr_step_profile=curr_step_profile
+                        )
+                        t_rollout_end = time.perf_counter()
+                        print(f"[ROLLOUT] walltime_after={t_rollout_end:.6f} duration={t_rollout_end - t_rollout_start:.3f}s step={self.global_steps}", flush=True)
 
                         # 记录 Rollout 轨迹点
                         trace = gen_batch_output.meta_info.get('effective_bs_trace')
                         if trace:
                             total_capacity = len(gen_batch_output)
-                            for t_offset, active_n in trace:
-                                logger.log({
-                                    "profiler/logical_utilization_pct": (active_n / total_capacity) * 100
-                                }, step=int((step_wall_time + t_offset) * 1000))
+                            # for t_offset, active_n in trace:
+                            #     logger.log({
+                            #         "profiler/logical_utilization_pct": (active_n / total_capacity) * 100
+                            #     }, step=int((step_wall_time + t_offset) * 1000))
                                 
                         seq_trace = gen_batch_output.meta_info.get('effective_seq_len_trace')
                         # if seq_trace:
@@ -1433,15 +1482,9 @@ class RayPPOTrainer:
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                if curr_step_profile:
-                                    self.async_rollout_manager.start_profile()
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                                self.checkpoint_manager.sleep_replicas()
-                                if curr_step_profile:
-                                    self.async_rollout_manager.stop_profile()
+                            gen_baseline_output = self._generate_rollout_batch(
+                                gen_baseline_batch, curr_step_profile=curr_step_profile
+                            )
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
@@ -1473,6 +1516,7 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    self._print_longest_response("FIT_rollout", batch, self.global_steps)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1606,7 +1650,7 @@ class RayPPOTrainer:
                     if self.use_critic:
                         # 记录训练开始，利用率瞬拉至 100%
                         train_block_start = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
+                        # logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
                         
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
@@ -1615,19 +1659,19 @@ class RayPPOTrainer:
                         
                         # 记录训练结束点
                         train_block_end = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
+                        # logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # 记录 Actor 训练开始点
                         train_block_start = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
+                        # logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
                         
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 
                         # 记录 Actor 训练结束点
                         train_block_end = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
+                        # logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
 
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
@@ -1714,7 +1758,9 @@ class RayPPOTrainer:
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    print(f"[FIT] wall_total={time.perf_counter() - fit_wall_start:.3f}s (completed)", flush=True)
                     return
 
                 if hasattr(self.train_dataset, "on_batch_end"):
                     self.train_dataset.on_batch_end(batch=batch)
+        print(f"[FIT] wall_total={time.perf_counter() - fit_wall_start:.3f}s (epoch_end)", flush=True)

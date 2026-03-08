@@ -140,6 +140,8 @@ algorithm:
     weight_pow: 2.0
 
 trainer:
+  # Optional fully qualified trainer class name. Defaults to RayPPOTrainer.
+  trainer_class: null
   balance_batch: True
   total_epochs: 30
   total_training_steps: null

@@ -17,6 +17,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -195,6 +196,7 @@ class SGLangHttpServer:
         self._stream_queues: dict[str, asyncio.Queue] = {}
         self._stream_tasks: dict[str, asyncio.Task] = {}
         self._stream_meta: dict[str, dict] = {}
+        self._stream_groups: dict[str, list[str]] = {}
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -456,21 +458,31 @@ class SGLangHttpServer:
             request.update({"return_routed_experts": True})
 
         generate_request = GenerateReqInput(**request)
+        arrival_time = time.time()
 
-        output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        final_output = None
+        gen = self.tokenizer_manager.generate_request(generate_request, None)
+        async for output in gen:
+            final_output = output
+
+        finish_offset = time.time() - arrival_time
+        assert final_output is not None, "SGLang generate_request returned no outputs"
+
         if return_logprob:
-            output_token_logprobs = output["meta_info"]["output_token_logprobs"]
+            output_token_logprobs = final_output["meta_info"]["output_token_logprobs"]
             log_probs, token_ids = zip(
                 *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
             )
+            token_ids = list(token_ids)
+            log_probs = list(log_probs)
         else:
-            token_ids = output["output_ids"]
+            token_ids = final_output["output_ids"]
             log_probs = None
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             if self.config.skip_tokenizer_init:
-                routed_experts = output.get("meta_info", {}).get("routed_experts", None)
+                routed_experts = final_output.get("meta_info", {}).get("routed_experts", None)
             else:
                 from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
 
@@ -481,11 +493,18 @@ class SGLangHttpServer:
                         "'num_hidden_layers' or 'num_experts_per_tok'. This feature requires an MoE model "
                         "configuration that defines these attributes."
                     )
-                routed_experts = extract_routed_experts_from_meta_info(output).reshape(
+                routed_experts = extract_routed_experts_from_meta_info(final_output).reshape(
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts)
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=log_probs,
+            routed_experts=routed_experts,
+            stop_reason="completed",
+            finish_time=finish_offset,
+            generated_len=len(token_ids),
+        )
 
     async def start_profile(self, **kwargs):
         if (
@@ -546,6 +565,7 @@ class SGLangHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        emit_token_deltas: bool = True,
     ) -> dict[str, Any]:
         if self.node_rank != 0:
             raise RuntimeError("start_generate_stream should only be called on node_rank 0")
@@ -584,8 +604,10 @@ class SGLangHttpServer:
         generate_request = GenerateReqInput(**request)
 
         handle = uuid4().hex
-        q: asyncio.Queue = asyncio.Queue(maxsize=256)
-        self._stream_queues[handle] = q
+        q: Optional[asyncio.Queue] = None
+        if emit_token_deltas:
+            q = asyncio.Queue(maxsize=256)
+            self._stream_queues[handle] = q
         self._stream_meta[handle] = {
             "request_id": request_id,
             "done": False,
@@ -593,6 +615,8 @@ class SGLangHttpServer:
             "stop_reason": None,
             "num_preempted": 0,
             "total_tokens": 0,
+            "output_token_ids": [],
+            "first_delta_meta_info": None,
         }
 
         async def _runner():
@@ -610,11 +634,14 @@ class SGLangHttpServer:
                     if cur_len > prev_len:
                         delta = token_ids[prev_len:cur_len]
                         prev_len = cur_len
+                        self._stream_meta[handle]["total_tokens"] = cur_len
                         evt = {"type": "delta", "token_ids": delta, "total_tokens": cur_len}
                         if is_first_delta:
                             is_first_delta = False
+                            self._stream_meta[handle]["first_delta_meta_info"] = meta_info
                             evt["meta_info"] = meta_info
-                        await q.put(evt)
+                        if q is not None:
+                            await q.put(evt)
 
                 finish_reason = "stop"
                 stop_reason = "completed"
@@ -624,14 +651,16 @@ class SGLangHttpServer:
                     "finish_reason": finish_reason,
                     "stop_reason": stop_reason,
                     "total_tokens": prev_len,
+                    "output_token_ids": token_ids if isinstance(token_ids, list) else list(token_ids),
                 })
-                await q.put({
-                    "type": "done",
-                    "finish_reason": finish_reason,
-                    "stop_reason": stop_reason,
-                    "total_tokens": prev_len,
-                    "meta_info": meta_info,
-                })
+                if q is not None:
+                    await q.put({
+                        "type": "done",
+                        "finish_reason": finish_reason,
+                        "stop_reason": stop_reason,
+                        "total_tokens": prev_len,
+                        "meta_info": meta_info,
+                    })
 
             except Exception as e:
                 self._stream_meta[handle].update({
@@ -640,7 +669,8 @@ class SGLangHttpServer:
                     "stop_reason": "error",
                     "total_tokens": prev_len,
                 })
-                await q.put({"type": "error", "error": str(e)})
+                if q is not None:
+                    await q.put({"type": "error", "error": str(e)})
 
         self._stream_tasks[handle] = asyncio.create_task(_runner())
 
@@ -654,6 +684,8 @@ class SGLangHttpServer:
     async def poll_generate_stream(self, handle: str, timeout_s: float = 0.0) -> Optional[dict[str, Any]]:
         q = self._stream_queues.get(handle)
         if q is None:
+            if handle in self._stream_meta:
+                return None
             return {"type": "error", "error": f"unknown handle {handle}"}
         try:
             if timeout_s and timeout_s > 0:
@@ -682,6 +714,59 @@ class SGLangHttpServer:
             if msg is not None:
                 results.append({"handle": h, **msg})
         return results
+
+    async def get_generate_stream_status_many(self, handles: list[str]) -> list[dict[str, Any]]:
+        results = []
+        for h in handles:
+            meta = self._stream_meta.get(h)
+            if meta is None:
+                results.append({"handle": h, "ok": False, "error": f"unknown handle {h}"})
+                continue
+            results.append(
+                {
+                    "handle": h,
+                    "ok": True,
+                    "done": bool(meta.get("done", False)),
+                    "total_tokens": int(meta.get("total_tokens", 0)),
+                    "finish_reason": meta.get("finish_reason"),
+                    "stop_reason": meta.get("stop_reason"),
+                }
+            )
+        return results
+
+    async def register_generate_stream_group(self, handles: list[str]) -> dict[str, Any]:
+        group_id = uuid4().hex
+        self._stream_groups[group_id] = list(handles)
+        return {"ok": True, "group_id": group_id, "size": len(handles)}
+
+    async def get_generate_stream_group_status(self, group_id: str) -> dict[str, Any]:
+        handles = self._stream_groups.get(group_id)
+        if handles is None:
+            return {"ok": False, "error": f"unknown group_id {group_id}"}
+
+        active_count = 0
+        done_count = 0
+        for h in handles:
+            meta = self._stream_meta.get(h)
+            if meta is None:
+                done_count += 1
+            elif meta.get("done", False):
+                done_count += 1
+            else:
+                active_count += 1
+
+        return {
+            "ok": True,
+            "group_id": group_id,
+            "total_count": len(handles),
+            "active_count": active_count,
+            "done_count": done_count,
+        }
+
+    async def clear_generate_stream_group(self, group_id: str) -> dict[str, Any]:
+        existed = group_id in self._stream_groups
+        self._stream_groups.pop(group_id, None)
+        return {"ok": True, "group_id": group_id, "existed": existed}
 
     async def finalize_generate_stream(self, handle: str) -> dict[str, Any]:
         t = self._stream_tasks.get(handle)

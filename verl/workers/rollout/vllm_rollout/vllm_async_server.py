@@ -126,6 +126,7 @@ class vLLMHttpServer:
         self._stream_queues: dict[str, asyncio.Queue] = {}
         self._stream_tasks: dict[str, asyncio.Task] = {}
         self._stream_meta: dict[str, dict] = {}
+        self._stream_groups: dict[str, list[str]] = {}
         
         self.replica_rank = replica_rank
         self.node_rank = node_rank
@@ -795,6 +796,7 @@ class vLLMHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        emit_token_deltas: bool = True,
     ) -> dict[str, Any]:
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
 
@@ -834,8 +836,10 @@ class vLLMHttpServer:
                 )
 
         handle = uuid4().hex
-        q: asyncio.Queue = asyncio.Queue(maxsize=256)  # backpressure
-        self._stream_queues[handle] = q
+        q: Optional[asyncio.Queue] = None
+        if emit_token_deltas:
+            q = asyncio.Queue(maxsize=256)  # backpressure
+            self._stream_queues[handle] = q
         self._stream_meta[handle] = {
             "request_id": request_id,
             "done": False,
@@ -843,6 +847,7 @@ class vLLMHttpServer:
             "stop_reason": None,
             "num_preempted": 0,
             "total_tokens": 0,
+            "output_token_ids": [],
         }
 
         async def _runner():
@@ -864,13 +869,22 @@ class vLLMHttpServer:
                     if cur_len > prev_len:
                         delta = token_ids[prev_len:cur_len]
                         prev_len = cur_len
-                        await q.put({"type": "delta", "token_ids": delta, "total_tokens": cur_len})
+                        self._stream_meta[handle]["total_tokens"] = cur_len
+                        if q is not None:
+                            await q.put({"type": "delta", "token_ids": delta, "total_tokens": cur_len})
 
                 if final_out is None:
                     self._stream_meta[handle].update(
-                        {"done": True, "finish_reason": "abort", "stop_reason": "aborted", "total_tokens": prev_len}
+                        {
+                            "done": True,
+                            "finish_reason": "abort",
+                            "stop_reason": "aborted",
+                            "total_tokens": prev_len,
+                            "output_token_ids": [],
+                        }
                     )
-                    await q.put({"type": "done", "finish_reason": "abort", "stop_reason": "aborted"})
+                    if q is not None:
+                        await q.put({"type": "done", "finish_reason": "abort", "stop_reason": "aborted"})
                     return
 
                 finish_reason = final_out.outputs[0].finish_reason
@@ -892,23 +906,26 @@ class vLLMHttpServer:
                         "stop_reason": stop_reason,
                         "num_preempted": num_preempted,
                         "total_tokens": prev_len,
+                        "output_token_ids": list(final_out.outputs[0].token_ids),
                     }
                 )
-                await q.put(
-                    {
-                        "type": "done",
-                        "finish_reason": finish_reason,
-                        "stop_reason": stop_reason,
-                        "num_preempted": num_preempted,
-                        "total_tokens": prev_len,
-                    }
-                )
+                if q is not None:
+                    await q.put(
+                        {
+                            "type": "done",
+                            "finish_reason": finish_reason,
+                            "stop_reason": stop_reason,
+                            "num_preempted": num_preempted,
+                            "total_tokens": prev_len,
+                        }
+                    )
 
             except Exception as e:
                 self._stream_meta[handle].update(
                     {"done": True, "finish_reason": "error", "stop_reason": "error", "total_tokens": prev_len}
                 )
-                await q.put({"type": "error", "error": str(e)})
+                if q is not None:
+                    await q.put({"type": "error", "error": str(e)})
 
         self._stream_tasks[handle] = asyncio.create_task(_runner())
 
@@ -922,6 +939,8 @@ class vLLMHttpServer:
     async def poll_generate_stream(self, handle: str, timeout_s: float = 0.0) -> Optional[dict[str, Any]]:
         q = self._stream_queues.get(handle)
         if q is None:
+            if handle in self._stream_meta:
+                return None
             return {"type": "error", "error": f"unknown handle {handle}"}
 
         try:
@@ -943,6 +962,59 @@ class vLLMHttpServer:
             pass
         meta = self._stream_meta.get(handle, {})
         return {"ok": True, **meta}
+
+    async def get_generate_stream_status_many(self, handles: list[str]) -> list[dict[str, Any]]:
+        results = []
+        for h in handles:
+            meta = self._stream_meta.get(h)
+            if meta is None:
+                results.append({"handle": h, "ok": False, "error": f"unknown handle {h}"})
+                continue
+            results.append(
+                {
+                    "handle": h,
+                    "ok": True,
+                    "done": bool(meta.get("done", False)),
+                    "total_tokens": int(meta.get("total_tokens", 0)),
+                    "finish_reason": meta.get("finish_reason"),
+                    "stop_reason": meta.get("stop_reason"),
+                }
+            )
+        return results
+
+    async def register_generate_stream_group(self, handles: list[str]) -> dict[str, Any]:
+        group_id = uuid4().hex
+        self._stream_groups[group_id] = list(handles)
+        return {"ok": True, "group_id": group_id, "size": len(handles)}
+
+    async def get_generate_stream_group_status(self, group_id: str) -> dict[str, Any]:
+        handles = self._stream_groups.get(group_id)
+        if handles is None:
+            return {"ok": False, "error": f"unknown group_id {group_id}"}
+
+        active_count = 0
+        done_count = 0
+        for h in handles:
+            meta = self._stream_meta.get(h)
+            if meta is None:
+                done_count += 1
+            elif meta.get("done", False):
+                done_count += 1
+            else:
+                active_count += 1
+
+        return {
+            "ok": True,
+            "group_id": group_id,
+            "total_count": len(handles),
+            "active_count": active_count,
+            "done_count": done_count,
+        }
+
+    async def clear_generate_stream_group(self, group_id: str) -> dict[str, Any]:
+        existed = group_id in self._stream_groups
+        self._stream_groups.pop(group_id, None)
+        return {"ok": True, "group_id": group_id, "existed": existed}
 
     async def cancel_generate_stream(self, handle: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         meta = self._stream_meta.get(handle)
@@ -1140,6 +1212,7 @@ class vLLMReplica(RolloutReplica):
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        emit_token_deltas: bool = True,
     ) -> dict[str, Any]:
         """
         Start a streaming generation and return a handle immediately.
@@ -1183,8 +1256,10 @@ class vLLMReplica(RolloutReplica):
                 )
 
         handle = uuid4().hex
-        q: asyncio.Queue = asyncio.Queue(maxsize=256)  # backpressure
-        self._stream_queues[handle] = q
+        q: Optional[asyncio.Queue] = None
+        if emit_token_deltas:
+            q = asyncio.Queue(maxsize=256)  # backpressure
+            self._stream_queues[handle] = q
         self._stream_meta[handle] = {
             "request_id": request_id,
             "done": False,
@@ -1192,6 +1267,7 @@ class vLLMReplica(RolloutReplica):
             "stop_reason": None,
             "num_preempted": 0,
             "total_tokens": 0,
+            "output_token_ids": [],
         }
 
         async def _runner():
@@ -1213,13 +1289,22 @@ class vLLMReplica(RolloutReplica):
                     if cur_len > prev_len:
                         delta = token_ids[prev_len:cur_len]
                         prev_len = cur_len
-                        await q.put({"type": "delta", "token_ids": delta, "total_tokens": cur_len})
+                        self._stream_meta[handle]["total_tokens"] = cur_len
+                        if q is not None:
+                            await q.put({"type": "delta", "token_ids": delta, "total_tokens": cur_len})
 
                 if final_out is None:
                     self._stream_meta[handle].update(
-                        {"done": True, "finish_reason": "abort", "stop_reason": "aborted", "total_tokens": prev_len}
+                        {
+                            "done": True,
+                            "finish_reason": "abort",
+                            "stop_reason": "aborted",
+                            "total_tokens": prev_len,
+                            "output_token_ids": [],
+                        }
                     )
-                    await q.put({"type": "done", "finish_reason": "abort", "stop_reason": "aborted"})
+                    if q is not None:
+                        await q.put({"type": "done", "finish_reason": "abort", "stop_reason": "aborted"})
                     return
 
                 finish_reason = final_out.outputs[0].finish_reason
@@ -1241,23 +1326,26 @@ class vLLMReplica(RolloutReplica):
                         "stop_reason": stop_reason,
                         "num_preempted": num_preempted,
                         "total_tokens": prev_len,
+                        "output_token_ids": list(final_out.outputs[0].token_ids),
                     }
                 )
-                await q.put(
-                    {
-                        "type": "done",
-                        "finish_reason": finish_reason,
-                        "stop_reason": stop_reason,
-                        "num_preempted": num_preempted,
-                        "total_tokens": prev_len,
-                    }
-                )
+                if q is not None:
+                    await q.put(
+                        {
+                            "type": "done",
+                            "finish_reason": finish_reason,
+                            "stop_reason": stop_reason,
+                            "num_preempted": num_preempted,
+                            "total_tokens": prev_len,
+                        }
+                    )
 
             except Exception as e:
                 self._stream_meta[handle].update(
                     {"done": True, "finish_reason": "error", "stop_reason": "error", "total_tokens": prev_len}
                 )
-                await q.put({"type": "error", "error": str(e)})
+                if q is not None:
+                    await q.put({"type": "error", "error": str(e)})
 
         self._stream_tasks[handle] = asyncio.create_task(_runner())
 
@@ -1271,6 +1359,8 @@ class vLLMReplica(RolloutReplica):
     async def poll_generate_stream(self, handle: str, timeout_s: float = 0.0) -> Optional[dict[str, Any]]:
         q = self._stream_queues.get(handle)
         if q is None:
+            if handle in self._stream_meta:
+                return None
             return {"type": "error", "error": f"unknown handle {handle}"}
 
         try:
@@ -1292,6 +1382,59 @@ class vLLMReplica(RolloutReplica):
             pass
         meta = self._stream_meta.get(handle, {})
         return {"ok": True, **meta}
+
+    async def get_generate_stream_status_many(self, handles: list[str]) -> list[dict[str, Any]]:
+        results = []
+        for h in handles:
+            meta = self._stream_meta.get(h)
+            if meta is None:
+                results.append({"handle": h, "ok": False, "error": f"unknown handle {h}"})
+                continue
+            results.append(
+                {
+                    "handle": h,
+                    "ok": True,
+                    "done": bool(meta.get("done", False)),
+                    "total_tokens": int(meta.get("total_tokens", 0)),
+                    "finish_reason": meta.get("finish_reason"),
+                    "stop_reason": meta.get("stop_reason"),
+                }
+            )
+        return results
+
+    async def register_generate_stream_group(self, handles: list[str]) -> dict[str, Any]:
+        group_id = uuid4().hex
+        self._stream_groups[group_id] = list(handles)
+        return {"ok": True, "group_id": group_id, "size": len(handles)}
+
+    async def get_generate_stream_group_status(self, group_id: str) -> dict[str, Any]:
+        handles = self._stream_groups.get(group_id)
+        if handles is None:
+            return {"ok": False, "error": f"unknown group_id {group_id}"}
+
+        active_count = 0
+        done_count = 0
+        for h in handles:
+            meta = self._stream_meta.get(h)
+            if meta is None:
+                done_count += 1
+            elif meta.get("done", False):
+                done_count += 1
+            else:
+                active_count += 1
+
+        return {
+            "ok": True,
+            "group_id": group_id,
+            "total_count": len(handles),
+            "active_count": active_count,
+            "done_count": done_count,
+        }
+
+    async def clear_generate_stream_group(self, group_id: str) -> dict[str, Any]:
+        existed = group_id in self._stream_groups
+        self._stream_groups.pop(group_id, None)
+        return {"ok": True, "group_id": group_id, "existed": existed}
 
     async def cancel_generate_stream(self, handle: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         meta = self._stream_meta.get(handle)
