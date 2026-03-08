@@ -414,6 +414,7 @@ class SGLangHttpServer:
         request_id: str,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        training_global_step: Optional[int] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
@@ -451,6 +452,8 @@ class SGLangHttpServer:
             # TODO: support video input for sglang
             # video_data=video_data,
         }
+        if training_global_step is not None:
+            request["training_global_step"] = training_global_step
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -546,6 +549,7 @@ class SGLangHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        training_global_step: Optional[int] = None,
     ) -> dict[str, Any]:
         if self.node_rank != 0:
             raise RuntimeError("start_generate_stream should only be called on node_rank 0")
@@ -577,6 +581,8 @@ class SGLangHttpServer:
             "stream": True,
             "image_data": image_data,
         }
+        if training_global_step is not None:
+            request["training_global_step"] = training_global_step
 
         if self.config.enable_rollout_routing_replay:
             request["return_routed_experts"] = True
