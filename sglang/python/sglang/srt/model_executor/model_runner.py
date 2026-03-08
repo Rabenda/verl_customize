@@ -448,25 +448,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # Init green context streams (20%, 50%, 80%, 100% SMs) for SM partitioning
+        # Init green context streams for SM partitioning
         self.green_streams = None
         self._green_resources = None
-        # if self.device != "cpu":
-        #     from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
-        #     print(f"[PuzzRL debug] init green context streams")
-        #     req_sm = int(os.environ.get("SGLANG_GREENCTX_REQ_SM", "66"))
-        #     dev = torch.device(f"cuda:{self.gpu_id}")
-        #     streams, resources = split_device_green_ctx_by_sm_count(dev, [req_sm])
-        #     # total_sms = torch.cuda.get_device_properties(dev).multi_processor_count
-        #     # sm_counts = [
-        #     #     max(1, int(0.20 * total_sms)),
-        #     #     max(1, int(0.50 * total_sms)),
-        #     #     max(1, int(0.80 * total_sms)),
-        #     # ]
-        #     # streams, resources = split_device_green_ctx_by_sm_count(dev, sm_counts)
-        #     self.green_streams = streams  # [stream_20%, stream_50%, stream_80%, stream_100%]
-        #     self._green_resources = resources  # keep ref to avoid GC
-        #     print(f"[PuzzRL debug] init green context streams done {self.green_streams}")
+        self._green_sm_counts = []
+        gc_sm_env = os.environ.get("SGLANG_GREENCTX_SM", "")
+        if gc_sm_env and self.device != "cpu":
+            sm_counts = [int(x) for x in gc_sm_env.split(",") if x.strip()]
+            if sm_counts:
+                self.init_green_context(sm_counts)
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -2448,6 +2438,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.split_index = next_split_index
         return ret
 
+    # ---- Green Context dynamic control ----
+
+    def init_green_context(self, sm_counts: list[int]):
+        """Create green context streams for the given SM partition sizes.
+
+        After calling this, ``self.green_streams[i]`` is a CUDA stream
+        limited to ``sm_counts[i]`` SMs.  The last entry in
+        ``self.green_streams`` is the *remainder* partition.
+        """
+        from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+        dev = torch.device(f"cuda:{self.gpu_id}")
+        streams, resources = split_device_green_ctx_by_sm_count(dev, sm_counts)
+        self.green_streams = streams
+        self._green_resources = resources
+        self._green_sm_counts = list(sm_counts)
+        print(
+            f"[GreenCtx] init done  gpu={self.gpu_id}  "
+            f"requested_sms={sm_counts}  n_streams={len(streams)}",
+            flush=True,
+        )
+
+    def set_green_context_sm(self, sm_count: int):
+        """Re-initialise green context with a single SM partition of *sm_count*.
+
+        Convenience wrapper: destroys existing green streams and creates
+        a fresh pair (sm_count | remainder).
+        """
+        self.init_green_context([sm_count])
+
+    def clear_green_context(self):
+        """Remove all green context streams; forward reverts to default."""
+        self.green_streams = None
+        self._green_resources = None
+        self._green_sm_counts = []
+
     def _select_green_stream(self, forward_batch: ForwardBatch):
         """Select stream for green context. Returns None to use default stream (100% SM)."""
         if self.green_streams is None:
@@ -2456,7 +2482,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if algo == "disable":
             return None
         if algo == "naive":
-            return self.green_streams[0]  # default stream, 100% SM
+            return self.green_streams[0]
         if algo == "prefill_decode":
             has_prefill = (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
@@ -2464,7 +2490,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if has_prefill:
                 return None  # 100%
-            return self.green_streams[0]  # 50%
+            return self.green_streams[0]
         return None
 
     def forward(
