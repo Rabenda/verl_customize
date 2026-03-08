@@ -180,6 +180,7 @@ class AsyncLLMServerManager:
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        training_global_step: Optional[int] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -187,6 +188,7 @@ class AsyncLLMServerManager:
             request_id (str): request id for sticky session.
             prompt_ids (List[int]): List of prompt token ids.
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            training_global_step (Optional[int]): Current training step for inference CSV logging.
 
         Returns:
             TokenOutput: token output
@@ -201,6 +203,7 @@ class AsyncLLMServerManager:
             sampling_params=sampling_params,
             image_data=image_data,
             video_data=video_data,
+            training_global_step=training_global_step,
         )
         return output
 
@@ -558,9 +561,11 @@ class AgentLoopWorker:
         )
 
         tasks = []
+        global_steps = batch.meta_info.get("global_steps", -1)
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            kwargs["global_steps"] = global_steps
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -632,10 +637,17 @@ class AgentLoopWorker:
 
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
+        # Truncate prompts that exceed prompt_length so batch concat in _postprocess does not fail (e.g. math+llama 514 vs 512).
+        # tokenizer.pad() does not accept truncation=, so truncate manually (keep right part for left-padded prompts).
+        # for llama3.1-8b math dataset, prompt_length is 514 
+        prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
+        prompt_ids = output.prompt_ids
+        if len(prompt_ids) > prompt_length:
+            prompt_ids = prompt_ids[-prompt_length:]
         prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
+            {"input_ids": prompt_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            max_length=prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )

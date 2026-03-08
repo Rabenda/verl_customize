@@ -65,6 +65,7 @@ class AgentData:
         tools_kwargs: dict[str, Any],
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
+        global_steps: Optional[int] = None,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -74,6 +75,7 @@ class AgentData:
         self.tools_kwargs = tools_kwargs
         self.interaction = interaction
         self.interaction_kwargs = interaction_kwargs or {}
+        self.global_steps = global_steps
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -92,7 +94,7 @@ class AgentData:
         self.extra_fields: dict[str, Any] = {}
 
 
-@register("tool_agent")
+@register("tool_agent") ###
 class ToolAgentLoop(AgentLoopBase):
     def __init__(
         self,
@@ -168,6 +170,7 @@ class ToolAgentLoop(AgentLoopBase):
             tools_kwargs=tools_kwargs,
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
+            global_steps=kwargs.get("global_steps"),
         )
 
         # State machine loop
@@ -232,6 +235,7 @@ class ToolAgentLoop(AgentLoopBase):
                 sampling_params=sampling_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
+                training_global_step=agent_data.global_steps,
             )
         # first time to set num_preempted
         if agent_data.metrics.get("num_preempted") is None:

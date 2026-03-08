@@ -238,8 +238,13 @@ _inference_log_lock = threading.Lock()
 def _get_inference_log_csv_path() -> str:
     suffix = os.environ.get("SGLANG_INFERENCE_LOG_SUFFIX", "default")
     if suffix == "default":
-        return f"{LOG_INFERENCE_STEP_CSV_BASE}.csv"
-    return f"{LOG_INFERENCE_STEP_CSV_BASE}_{suffix}.csv"
+        fname = f"{LOG_INFERENCE_STEP_CSV_BASE}.csv"
+    else:
+        fname = f"{LOG_INFERENCE_STEP_CSV_BASE}_{suffix}.csv"
+    log_dir = os.environ.get("SGLANG_INFERENCE_LOG_DIR", "")
+    if log_dir:
+        return os.path.join(log_dir, fname)
+    return fname
 
 
 def _append_inference_step_log(
@@ -250,8 +255,12 @@ def _append_inference_step_log(
     decode_tokens: int,
     avg_seq_len: float,
     forward_time_ms: float,
+    global_step: int = -1,
 ):
     path = _get_inference_log_csv_path()
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with _inference_log_lock:
         write_header = not os.path.exists(path) or os.path.getsize(path) == 0
         with open(path, "a", newline="") as f:
@@ -266,6 +275,7 @@ def _append_inference_step_log(
                         "decode_tokens",
                         "avg_seq_len",
                         "forward_time_ms",
+                        "global_step",
                     ]
                 )
             writer.writerow(
@@ -277,6 +287,7 @@ def _append_inference_step_log(
                     decode_tokens,
                     f"{avg_seq_len:.2f}",
                     f"{forward_time_ms:.2f}",
+                    global_step,
                 ]
             )
 
@@ -2589,6 +2600,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 decode_tokens=decode_tokens,
                 avg_seq_len=avg_seq_len,
                 forward_time_ms=forward_time_ms,
+                global_step=getattr(forward_batch, "training_global_step", -1),
             )
 
         return output
