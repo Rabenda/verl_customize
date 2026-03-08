@@ -377,6 +377,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # Training global step for inference step CSV (default -1 when not training)
+    training_global_step: int = -1
+
     @classmethod
     def init_new(
         cls,
@@ -421,6 +424,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            training_global_step=getattr(batch, "training_global_step", -1),
         )
         device = model_runner.device
 

@@ -245,6 +245,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
+    # Training global step (for logging; non-training requests use -1)
+    training_global_step: Optional[int] = None
+
     # Priority for the request
     priority: Optional[int] = None
 
@@ -676,6 +679,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
             conversation_id=self.conversation_id,
+            training_global_step=(
+                self.training_global_step[i]
+                if isinstance(self.training_global_step, list)
+                else self.training_global_step
+            ),
             priority=self.priority,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
@@ -770,6 +778,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+
+    # Training global step (for inference step CSV; non-training use -1)
+    training_global_step: Optional[int] = None
 
 
 @dataclass

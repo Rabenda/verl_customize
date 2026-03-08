@@ -545,6 +545,7 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        training_global_step: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -607,6 +608,7 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.training_global_step = training_global_step
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -2237,6 +2239,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            training_global_step=(
+                self.reqs[0].training_global_step
+                if self.reqs
+                and getattr(self.reqs[0], "training_global_step", None) is not None
+                else -1
+            ),
         )
 
     def copy(self):
@@ -2424,3 +2432,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # Training global step for inference step CSV (default -1 when not training)
+    training_global_step: int = -1

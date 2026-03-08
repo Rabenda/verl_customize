@@ -150,6 +150,7 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             vocab_size=vocab_size,
+            training_global_step=getattr(req, "training_global_step", None),
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
