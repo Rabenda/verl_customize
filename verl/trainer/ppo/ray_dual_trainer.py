@@ -1185,6 +1185,28 @@ class DualRayPPOTrainer:
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
 
+        # 方案 B: 每个 step 将本 batch 的 decoding length 追加到 CSV（multi turn / dual 通用）
+        # multi-turn 时若 batch 带 __num_turns__，则多写一列 turn
+        decoding_length_csv_dir = self.config.trainer.get("decoding_length_csv_dir", None)
+        if decoding_length_csv_dir is not None:
+            os.makedirs(decoding_length_csv_dir, exist_ok=True)
+            lengths = batch.batch["response_mask"].sum(dim=-1).cpu().tolist()
+            exp_name = getattr(self.config.trainer, "experiment_name", "run")
+            safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(exp_name))
+            csv_path = os.path.join(decoding_length_csv_dir, f"lengths_{safe_name}_{which}.csv")
+            num_turns = batch.non_tensor_batch.get("__num_turns__", None)
+            write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+            with open(csv_path, "a", newline="") as f:
+                if num_turns is not None:
+                    turns = np.asarray(num_turns).ravel()
+                    if write_header:
+                        f.write("length,turn\n")
+                    for L, t in zip(lengths, turns, strict=True):
+                        f.write(f"{L},{int(t)}\n")
+                else:
+                    for L in lengths:
+                        f.write(f"{L}\n")
+
         assert not self.config.trainer.balance_batch
 
         reward_extra_infos_dict = {}

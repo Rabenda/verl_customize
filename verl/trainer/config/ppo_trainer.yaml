@@ -158,6 +158,11 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Directory for appending per-sample decoding lengths (one row per sample, no header).
+  # When set, each step appends train_batch_size*rollout.n rows to lengths_{experiment_name}.csv.
+  # Used by show_the_plot_multi_step.py (single/multi turn both use this in RayPPOTrainer).
+  decoding_length_csv_dir: null
+
   # Number of nodes used in the training
   nnodes: 1
 

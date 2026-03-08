@@ -21,10 +21,11 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import ray
@@ -130,6 +131,101 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def rollout_token_stats_from_batch(batch: DataProto, tokenizer=None):
+    """
+    Return dict of stats for rollout token lengths in current batch.
+    Prefer non_tensor 'global_token_num', else fallback to attention_mask.
+    (Copied from ray_dual_trainer for single-model alignment.)
+    """
+    lens = None
+    if hasattr(batch, "non_tensor_batch") and "global_token_num" in batch.non_tensor_batch:
+        lens = batch.non_tensor_batch["global_token_num"]
+    elif hasattr(batch, "meta_info") and "global_token_num" in batch.meta_info:
+        lens = batch.meta_info["global_token_num"]
+    elif "attention_mask" in batch.batch:
+        am = batch.batch["attention_mask"]
+        lens = am.sum(dim=-1).to(torch.int).cpu().tolist()
+    else:
+        pad_id = getattr(tokenizer, "pad_token_id", 0) if tokenizer is not None else 0
+        if "input_ids" in batch.batch:
+            lens = (batch.batch["input_ids"] != pad_id).sum(dim=-1).to(torch.int).cpu().tolist()
+
+    if lens is None:
+        return {}
+    if isinstance(lens, np.ndarray):
+        lens = lens.tolist()
+    if isinstance(lens, torch.Tensor):
+        lens = lens.cpu().tolist()
+    if len(lens) == 0:
+        return {}
+
+    arr = np.asarray(lens, dtype=np.int64)
+    return {
+        "rollout_tokens/min": int(arr.min()),
+        "rollout_tokens/max": int(arr.max()),
+        "rollout_tokens/mean": float(arr.mean()),
+        "rollout_tokens/p50": float(np.percentile(arr, 50)),
+        "rollout_tokens/p90": float(np.percentile(arr, 90)),
+        "rollout_tokens/p99": float(np.percentile(arr, 99)),
+        "rollout_tokens/n": int(arr.size),
+    }
+
+
+@dataclass
+class StepProfiler:
+    """单模型 step 级 timing 统计，与 ray_dual_trainer 的 StepProfiler 对齐（无 a/b 双路）."""
+    enabled: bool = True
+    verbose: bool = True
+    print_every: int = 1
+    window: int = 1
+    print_rollout_each: bool = True
+
+    _hist: Dict[str, deque] = field(default_factory=lambda: defaultdict(deque))
+    _sum: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    _cnt: int = 0
+
+    def update(self, timing_raw: Dict[str, float], step: int, prefix: str = ""):
+        if not self.enabled:
+            return
+        self._cnt += 1
+        for k, v in timing_raw.items():
+            if v is None:
+                continue
+            key = f"{prefix}{k}" if prefix else k
+            self._sum[key] += float(v)
+            dq = self._hist[key]
+            dq.append(float(v))
+            if len(dq) > self.window:
+                dq.popleft()
+        if self.verbose and self.print_every > 0 and (step % self.print_every == 0):
+            print(self.format_report(step=step))
+
+    def mean(self, key: str) -> float:
+        dq = self._hist.get(key)
+        if not dq:
+            return 0.0
+        return sum(dq) / len(dq)
+
+    def total_mean(self, key: str) -> float:
+        if self._cnt == 0:
+            return 0.0
+        return self._sum.get(key, 0.0) / self._cnt
+
+    def format_report(self, step: int) -> str:
+        order = [
+            "step", "gen", "gen_max", "reward", "old_log_prob", "values", "adv",
+            "update_critic", "update_actor", "save_checkpoint", "update_weights",
+            "testing", "start_profile", "stop_profile", "dump_rollout_generations",
+        ]
+        present_ordered = [k for k in order if k in self._hist]
+        extra = [k for k in self._hist if k not in order]
+        present_ordered.extend(sorted(extra))
+        parts = [f"[profile] step={step} window={self.window}"]
+        for k in present_ordered:
+            parts.append(f"{k}: {self.mean(k):.2f}s")
+        return " | ".join(parts)
 
 
 def compute_advantage(
@@ -1348,6 +1444,16 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        # StepProfiler（单模型），与 ray_dual_trainer 对齐，从 config.trainer.profile 读配置
+        prof_cfg = self.config.trainer.get("profile", {})
+        self.profiler = StepProfiler(
+            enabled=prof_cfg.get("enabled", True),
+            verbose=prof_cfg.get("verbose", True),
+            print_every=prof_cfg.get("print_every", 1),
+            window=prof_cfg.get("window", 1),
+            print_rollout_each=prof_cfg.get("print_rollout_each", False),
+        )
+
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1407,19 +1513,17 @@ class RayPPOTrainer:
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
 
-                        # 记录 Rollout 轨迹点
-                        trace = gen_batch_output.meta_info.get('effective_bs_trace')
-                        if trace:
-                            total_capacity = len(gen_batch_output)
-                            for t_offset, active_n in trace:
-                                logger.log({
-                                    "profiler/logical_utilization_pct": (active_n / total_capacity) * 100
-                                }, step=int((step_wall_time + t_offset) * 1000))
-                                
-                        seq_trace = gen_batch_output.meta_info.get('effective_seq_len_trace')
+                        # 记录 Rollout 轨迹点（已关闭 profiler 打点，避免刷屏）
+                        # trace = gen_batch_output.meta_info.get('effective_bs_trace')
+                        # if trace:
+                        #     total_capacity = len(gen_batch_output)
+                        #     for t_offset, active_n in trace:
+                        #         logger.log({
+                        #             "profiler/logical_utilization_pct": (active_n / total_capacity) * 100
+                        #         }, step=int((step_wall_time + t_offset) * 1000))
+                        # seq_trace = gen_batch_output.meta_info.get('effective_seq_len_trace')
                         # if seq_trace:
                         #     for t_offset, total_len in seq_trace:
-                        #         # 记录总活跃序列长度随时间的变化
                         #         logger.log({
                         #             "profiler/total_active_tokens": total_len
                         #         }, step=int((step_wall_time + t_offset) * 1000))
@@ -1473,6 +1577,29 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # 方案 B: 每个 step 将本 batch 的 decoding length 按样本顺序追加到 CSV（single/multi turn 通用）
+                    # multi-turn 时若 batch 带 __num_turns__，则多写一列 turn，便于按 turn 区分
+                    _decoding_length_csv_dir = self.config.trainer.get("decoding_length_csv_dir", None)
+                    if _decoding_length_csv_dir is not None:
+                        os.makedirs(_decoding_length_csv_dir, exist_ok=True)
+                        lengths = batch.batch["response_mask"].sum(dim=-1).cpu().tolist()
+                        exp_name = getattr(self.config.trainer, "experiment_name", "run")
+                        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(exp_name))
+                        csv_path = os.path.join(_decoding_length_csv_dir, f"lengths_{safe_name}.csv")
+                        num_turns = batch.non_tensor_batch.get("__num_turns__", None)
+                        write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+                        with open(csv_path, "a", newline="") as f:
+                            if num_turns is not None:
+                                turns = np.asarray(num_turns).ravel()
+                                if write_header:
+                                    f.write("length,turn\n")
+                                for L, t in zip(lengths, turns, strict=True):
+                                    f.write(f"{L},{int(t)}\n")
+                            else:
+                                for L in lengths:
+                                    f.write(f"{L}\n")
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1604,30 +1731,26 @@ class RayPPOTrainer:
 
                     # --- 2. Update 阶段 (生成图中的矩形方块) ---
                     if self.use_critic:
-                        # 记录训练开始，利用率瞬拉至 100%
-                        train_block_start = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
-                        
+                        # 记录训练开始（profiler 打点已关闭）
+                        # train_block_start = time.time() - fit_start_time
+                        # logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
-                        
-                        # 记录训练结束点
-                        train_block_end = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
+                        # 记录训练结束点（profiler 打点已关闭）
+                        # train_block_end = time.time() - fit_start_time
+                        # logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # 记录 Actor 训练开始点
-                        train_block_start = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
-                        
+                        # 记录 Actor 训练开始点（profiler 打点已关闭）
+                        # train_block_start = time.time() - fit_start_time
+                        # logger.log({"profiler/logical_utilization_pct": 100.0}, step=int(train_block_start * 1000))
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
-
-                        # 记录 Actor 训练结束点
-                        train_block_end = time.time() - fit_start_time
-                        logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
+                        # 记录 Actor 训练结束点（profiler 打点已关闭）
+                        # train_block_end = time.time() - fit_start_time
+                        # logger.log({"profiler/logical_utilization_pct": 0.0}, step=int(train_block_end * 1000))
 
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
@@ -1680,6 +1803,29 @@ class RayPPOTrainer:
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
+                # ----- rollout length stats (min/max/mean)，与 ray_dual_trainer 对齐 -----
+                stats = rollout_token_stats_from_batch(batch, tokenizer=self.tokenizer)
+                if stats:
+                    print("[debug stats]", stats)
+                    for k, v in stats.items():
+                        metrics[k] = v
+                    if getattr(self, "profiler", None) is not None and self.profiler.enabled:
+                        if getattr(self.profiler, "verbose", True) and getattr(self.profiler, "print_rollout_each", True):
+                            print(
+                                f"[rollout-len] step={self.global_steps} "
+                                f"n={stats['rollout_tokens/n']} "
+                                f"min={stats['rollout_tokens/min']} "
+                                f"mean={stats['rollout_tokens/mean']:.1f} "
+                                f"p90={stats['rollout_tokens/p90']:.1f} "
+                                f"max={stats['rollout_tokens/max']}"
+                            )
+                if "global_token_num" not in batch.meta_info:
+                    if "attention_mask" in batch.batch:
+                        batch.meta_info["global_token_num"] = batch.batch["attention_mask"].sum(dim=-1).to(torch.int).tolist()
+                    else:
+                        pad_id = self.tokenizer.pad_token_id or 0
+                        batch.meta_info["global_token_num"] = (batch.batch["input_ids"] != pad_id).sum(dim=-1).to(torch.int).tolist()
+
                 metrics.update({
                     "training/global_step": self.global_steps,
                     "training/epoch": epoch,
@@ -1694,13 +1840,16 @@ class RayPPOTrainer:
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
+                if getattr(self, "profiler", None) is not None:
+                    self.profiler.update(timing_raw=timing_raw, step=self.global_steps)
+
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
                 if self.global_steps > 5:
                     print(f"OYHH_DEBUG: Reached 5 steps. Exiting.")
-                    import os; os._exit(0)
+                    os._exit(0)
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
