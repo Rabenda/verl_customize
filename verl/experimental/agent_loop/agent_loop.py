@@ -944,6 +944,11 @@ class AgentLoopWorker:
             "logprobs": logprobs,
         }
 
+        # 训练 global step，用于 inference_step_log.csv（非训练请求为 -1）
+        training_global_step = gen_batch.meta_info.get("global_steps", -1)
+        if training_global_step is None:
+            training_global_step = -1
+
         server = self.server_handles[replica]
 
         handles = []
@@ -967,6 +972,7 @@ class AgentLoopWorker:
                 prompt_ids=ids,
                 sampling_params=sampling_params,
                 request_id=rid,
+                training_global_step=training_global_step,
                 **kw,
             ))
             handles.append(ret["handle"])

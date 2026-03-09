@@ -1,0 +1,39 @@
+tools:
+  - class_name: verl.tools.search_tool.SearchTool
+    config:
+      retrieval_service_url: http://127.0.0.1:8000/retrieve
+      # Sync trainer uses this local retriever directly in the driver process.
+      # Prepare files with:
+      #   python examples/sglang_multiturn/search_r1_like/local_dense_retriever/download.py --save_path /home/zhengding/data/search_r1_retriever
+      #   cat /home/zhengding/data/search_r1_retriever/part_* > /home/zhengding/data/search_r1_retriever/e5_Flat.index
+      #   gzip -d /home/zhengding/data/search_r1_retriever/wiki-18.jsonl.gz
+      local_retriever:
+        retrieval_method: e5
+        index_path: /data/msarco_dataset/e5_Flat.index
+        corpus_path: /data/search_r1_retriever/wiki-18.jsonl
+        retrieval_model_path: intfloat/e5-large-v2
+        retrieval_topk: 3
+        retrieval_pooling_method: mean
+        retrieval_query_max_length: 256
+        retrieval_batch_size: 512
+        retrieval_use_fp16: true
+        faiss_gpu: false
+      num_workers: 120
+      rate_limit: 120
+      timeout: 90
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: Searches the web for relevant information based on the given query.
+        parameters:
+          type: object
+          properties:
+            query_list:
+              type: array
+              item:
+                type: string
+              description: A list of fully-formed semantic queries. The tool will return search results for each query.
+          required: 
+            - query_list

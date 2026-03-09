@@ -1908,6 +1908,7 @@ class DualRayPPOTrainer:
                         sampling_params=sampling_a,
                         request_id=rid,
                         emit_token_deltas=False,
+                        training_global_step=self.global_steps,
                     )
                     h = ret["handle"]
                     handles_a.append(h)
@@ -1963,6 +1964,7 @@ class DualRayPPOTrainer:
                                 sampling_params=sampling_b,
                                 request_id=rid,
                                 emit_token_deltas=False,
+                                training_global_step=self.global_steps,
                             )
                             h = ret["handle"]
                             handles_b.append(h)
@@ -2322,6 +2324,7 @@ class DualRayPPOTrainer:
                             prompt_ids=ids,
                             sampling_params=sampling_b,
                             request_id=rid,
+                            training_global_step=self.global_steps,
                         )
                         h = ret["handle"]
                         handles_b.append(h)
