@@ -41,14 +41,16 @@ def load_docs(corpus, doc_idxs):
     return results
 
 
-def load_model(model_path: str, use_fp16: bool = False):
+def load_model(model_path: str, use_fp16: bool = False, device: Optional[str] = None):
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
-    model.cuda()
-    if use_fp16:
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    if use_fp16 and device == "cuda":
         model = model.half()
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
-    return model, tokenizer
+    return model, tokenizer, device
 
 
 def pooling(pooler_output, last_hidden_state, attention_mask=None, pooling_method="mean"):
@@ -71,7 +73,7 @@ class Encoder:
         self.max_length = max_length
         self.use_fp16 = use_fp16
 
-        self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16)
+        self.model, self.tokenizer, self.device = load_model(model_path=model_path, use_fp16=use_fp16)
         self.model.eval()
 
     @torch.no_grad()
@@ -95,7 +97,7 @@ class Encoder:
         inputs = self.tokenizer(
             query_list, max_length=self.max_length, padding=True, truncation=True, return_tensors="pt"
         )
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         if "T5" in type(self.model).__name__:
             # T5-based retrieval model
@@ -116,7 +118,8 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
 
         del inputs, output
-        torch.cuda.empty_cache()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
         return query_emb
 
@@ -245,9 +248,19 @@ class DenseRetriever(BaseRetriever):
 
         results = []
         scores = []
+        idx_d = self.index.d
         for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc="Retrieval process: "):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
             batch_emb = self.encoder.encode(query_batch)
+            if batch_emb.ndim == 1:
+                batch_emb = batch_emb.reshape(1, -1)
+            batch_emb = np.ascontiguousarray(batch_emb.astype(np.float32), dtype=np.float32)
+            if batch_emb.shape[1] != idx_d:
+                raise ValueError(
+                    f"Embedding dim {batch_emb.shape[1]} != index dim {idx_d}. "
+                    "Index (e5_Flat.index) must match encoder (e.g. e5-large-v2=1024). "
+                    "Ensure index and retrieval_model_path are from the same setup."
+                )
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
@@ -262,7 +275,8 @@ class DenseRetriever(BaseRetriever):
             scores.extend(batch_scores)
 
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
-            torch.cuda.empty_cache()
+            if self.encoder.device == "cuda":
+                torch.cuda.empty_cache()
 
         if return_score:
             return results, scores
@@ -387,7 +401,7 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=3, help="Number of retrieved passages for one query.")
     parser.add_argument("--retriever_name", type=str, default="e5", help="Name of the retriever model.")
     parser.add_argument(
-        "--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model."
+        "--retriever_model", type=str, default="intfloat/e5-large-v2", help="Path of the retriever model."
     )
     parser.add_argument("--faiss_gpu", action="store_true", help="Use GPU for computation")
 

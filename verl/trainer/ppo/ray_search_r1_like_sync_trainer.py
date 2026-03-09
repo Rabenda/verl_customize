@@ -211,6 +211,31 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
         if not response_ids:
             return []
 
+        def _extract_queries_from_tool_args(tool_args: Any) -> list[str]:
+            """兼容不同 tool_args 格式（dict/list/str）。"""
+            if tool_args is None:
+                return []
+            # 常见：{"query_list": [...]}
+            if isinstance(tool_args, dict):
+                return _normalize_query_list(
+                    tool_args.get("query_list", tool_args.get("queries", tool_args.get("query")))
+                )
+            # 有些 parser 会直接给 list：["q1", "q2"] 或 [{"query_list":[...]}]
+            if isinstance(tool_args, list):
+                merged: list[str] = []
+                for item in tool_args:
+                    if isinstance(item, dict):
+                        merged.extend(
+                            _normalize_query_list(
+                                item.get("query_list", item.get("queries", item.get("query")))
+                            )
+                        )
+                    else:
+                        merged.extend(_normalize_query_list(item))
+                return merged
+            # 兜底：单个字符串/其它类型
+            return _normalize_query_list(tool_args)
+
         tool_calls = []
         try:
             _, tool_calls = asyncio.run(self._get_tool_parser().extract_tool_calls(response_ids))
@@ -225,7 +250,7 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
                 tool_args = json.loads(tool_call.arguments)
             except json.JSONDecodeError:
                 continue
-            merged_queries.extend(_normalize_query_list(tool_args.get("query_list")))
+            merged_queries.extend(_extract_queries_from_tool_args(tool_args))
         if merged_queries:
             return merged_queries
 
@@ -245,7 +270,7 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
                     tool_args = json.loads(fc.arguments)
                 except json.JSONDecodeError:
                     return []
-                return _normalize_query_list(tool_args.get("query_list"))
+                return _extract_queries_from_tool_args(tool_args)
 
         return []
 
@@ -281,8 +306,8 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
             retrieval_topk=retrieval_topk,
             index_path=index_path,
             corpus_path=corpus_path,
-            corpus_source=local_cfg.get("corpus_source"),
-            corpus_split=local_cfg.get("corpus_split", "train"),
+            dataset_path=local_cfg.get("dataset_path", "./data"),
+            data_split=local_cfg.get("corpus_split", local_cfg.get("data_split", "train")),
             faiss_gpu=bool(local_cfg.get("faiss_gpu", True)),
             retrieval_model_path=retrieval_model_path or "",
             retrieval_pooling_method=local_cfg.get("retrieval_pooling_method", "mean"),
@@ -459,6 +484,7 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
                         prompt_ids=state.prompt_ids,
                         sampling_params=sampling_params,
                         request_id=request_id,
+                        training_global_step=self.global_steps,
                     )
                     handle = ret["handle"]
                     handles.append(handle)

@@ -569,6 +569,7 @@ class SGLangHttpServer:
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
         emit_token_deltas: bool = True,
+        training_global_step: Optional[int] = None,
     ) -> dict[str, Any]:
         if self.node_rank != 0:
             raise RuntimeError("start_generate_stream should only be called on node_rank 0")

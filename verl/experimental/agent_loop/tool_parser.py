@@ -93,6 +93,17 @@ def _parse_tool_call_obj(obj: dict) -> FunctionCall | None:
     """Build FunctionCall from dict with 'name' and 'arguments' or 'parameters'. Returns None if invalid."""
     if not isinstance(obj, dict):
         return None
+
+    def _to_jsonable(x):
+        """Recursively convert common non-JSON types (e.g., set) to JSON-serializable."""
+        if isinstance(x, dict):
+            return {k: _to_jsonable(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [_to_jsonable(v) for v in x]
+        if isinstance(x, set):
+            return [_to_jsonable(v) for v in x]
+        return x
+
     name = obj.get("name")
     args_dict = obj.get("arguments") or obj.get("parameters")
     if name is None or args_dict is None:
@@ -103,7 +114,7 @@ def _parse_tool_call_obj(obj: dict) -> FunctionCall | None:
             args_dict = parsed if isinstance(parsed, dict) else {"query_list": args_dict}
         except json.JSONDecodeError:
             args_dict = {"query_list": args_dict}
-    arguments = json.dumps(args_dict, ensure_ascii=False)
+    arguments = json.dumps(_to_jsonable(args_dict), ensure_ascii=False)
     return FunctionCall(name=name, arguments=arguments)
 
 
