@@ -17,6 +17,7 @@
 
 import argparse
 import json
+import os
 import warnings
 from typing import Optional
 
@@ -31,8 +32,24 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 
-def load_corpus(corpus_path: str):
-    corpus = datasets.load_dataset("json", data_files=corpus_path, split="train", num_proc=4)
+def load_corpus(corpus_path: str, corpus_source: Optional[str] = None, corpus_split: str = "train"):
+    """
+    Load corpus from local JSONL file or HuggingFace dataset.
+
+    Args:
+        corpus_path: Local path to .jsonl file, or HuggingFace dataset id (e.g. "Tevatron/msmarco-passage-corpus").
+        corpus_source: "huggingface" or "hf" to load from HF; "local" or None to load from file.
+            If None, auto-detect: use HF when path is not an existing file/dir.
+        corpus_split: Split name for HuggingFace datasets (default "train").
+    """
+    use_hf = corpus_source in ("huggingface", "hf")
+    if not use_hf and corpus_source is None:
+        use_hf = not os.path.isfile(corpus_path) and not os.path.isdir(corpus_path)
+
+    if use_hf:
+        corpus = datasets.load_dataset(corpus_path, split=corpus_split)
+    else:
+        corpus = datasets.load_dataset("json", data_files=corpus_path, split="train", num_proc=4)
     return corpus
 
 
@@ -41,14 +58,16 @@ def load_docs(corpus, doc_idxs):
     return results
 
 
-def load_model(model_path: str, use_fp16: bool = False):
+def load_model(model_path: str, use_fp16: bool = False, device: Optional[str] = None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
-    model.cuda()
-    if use_fp16:
+    model.to(device)
+    if use_fp16 and device.startswith("cuda"):
         model = model.half()
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
-    return model, tokenizer
+    return model, tokenizer, device
 
 
 def pooling(pooler_output, last_hidden_state, attention_mask=None, pooling_method="mean"):
@@ -71,7 +90,7 @@ class Encoder:
         self.max_length = max_length
         self.use_fp16 = use_fp16
 
-        self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16)
+        self.model, self.tokenizer, self.device = load_model(model_path=model_path, use_fp16=use_fp16)
         self.model.eval()
 
     @torch.no_grad()
@@ -95,7 +114,7 @@ class Encoder:
         inputs = self.tokenizer(
             query_list, max_length=self.max_length, padding=True, truncation=True, return_tensors="pt"
         )
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         if "T5" in type(self.model).__name__:
             # T5-based retrieval model
@@ -116,7 +135,8 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
 
         del inputs, output
-        torch.cuda.empty_cache()
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
         return query_emb
 
@@ -151,7 +171,9 @@ class BM25Retriever(BaseRetriever):
         self.searcher = LuceneSearcher(self.index_path)
         self.contain_doc = self._check_contain_doc()
         if not self.contain_doc:
-            self.corpus = load_corpus(self.corpus_path)
+            corpus_source = getattr(config, "corpus_source", None)
+            corpus_split = getattr(config, "corpus_split", "train")
+            self.corpus = load_corpus(self.corpus_path, corpus_source=corpus_source, corpus_split=corpus_split)
         self.max_process_num = 8
 
     def _check_contain_doc(self):
@@ -213,7 +235,9 @@ class DenseRetriever(BaseRetriever):
             co.shard = True
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
-        self.corpus = load_corpus(self.corpus_path)
+        corpus_source = getattr(config, "corpus_source", None)
+        corpus_split = getattr(config, "corpus_split", "train")
+        self.corpus = load_corpus(self.corpus_path, corpus_source=corpus_source, corpus_split=corpus_split)
         self.encoder = Encoder(
             model_name=self.retrieval_method,
             model_path=config.retrieval_model_path,
@@ -294,6 +318,8 @@ class Config:
         retrieval_topk: int = 10,
         index_path: str = "./index/bm25",
         corpus_path: str = "./data/corpus.jsonl",
+        corpus_source: Optional[str] = None,
+        corpus_split: str = "train",
         dataset_path: str = "./data",
         data_split: str = "train",
         faiss_gpu: bool = True,
@@ -307,6 +333,8 @@ class Config:
         self.retrieval_topk = retrieval_topk
         self.index_path = index_path
         self.corpus_path = corpus_path
+        self.corpus_source = corpus_source
+        self.corpus_split = corpus_split
         self.dataset_path = dataset_path
         self.data_split = data_split
         self.faiss_gpu = faiss_gpu

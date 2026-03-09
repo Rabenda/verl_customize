@@ -166,7 +166,7 @@ class SGLangHttpServer:
         cuda_visible_devices: str,
         base_gpu_id: int,
     ):
-        print(f"SGLang http server: {rollout_mode=}, {replica_rank=}, {node_rank=}, {nnodes=}, {cuda_visible_devices=}")
+        # print(f"SGLang http server: {rollout_mode=}, {replica_rank=}, {node_rank=}, {nnodes=}, {cuda_visible_devices=}")  # rollout actor - commented out
         os.environ[visible_devices_keyword] = cuda_visible_devices
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
@@ -569,6 +569,7 @@ class SGLangHttpServer:
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
         emit_token_deltas: bool = True,
+        training_global_step: Optional[int] = None,
     ) -> dict[str, Any]:
         if self.node_rank != 0:
             raise RuntimeError("start_generate_stream should only be called on node_rank 0")
