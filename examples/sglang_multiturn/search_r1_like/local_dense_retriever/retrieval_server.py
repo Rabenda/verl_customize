@@ -17,6 +17,7 @@
 
 import argparse
 import json
+import time
 import warnings
 from typing import Optional
 
@@ -136,14 +137,26 @@ class BaseRetriever:
     def _search(self, query: str, num: int, return_score: bool):
         raise NotImplementedError
 
-    def _batch_search(self, query_list: list[str], num: int, return_score: bool):
+    def _batch_search(
+        self,
+        query_list: list[str],
+        num: int,
+        return_score: bool,
+        timing_out: Optional[dict] = None,
+    ):
         raise NotImplementedError
 
     def search(self, query: str, num: int = None, return_score: bool = False):
         return self._search(query, num, return_score)
 
-    def batch_search(self, query_list: list[str], num: int = None, return_score: bool = False):
-        return self._batch_search(query_list, num, return_score)
+    def batch_search(
+        self,
+        query_list: list[str],
+        num: int = None,
+        return_score: bool = False,
+        timing_out: Optional[dict] = None,
+    ):
+        return self._batch_search(query_list, num, return_score, timing_out=timing_out)
 
 
 class BM25Retriever(BaseRetriever):
@@ -193,7 +206,13 @@ class BM25Retriever(BaseRetriever):
         else:
             return results
 
-    def _batch_search(self, query_list: list[str], num: int = None, return_score: bool = False):
+    def _batch_search(
+        self,
+        query_list: list[str],
+        num: int = None,
+        return_score: bool = False,
+        timing_out: Optional[dict] = None,
+    ):
         results = []
         scores = []
         for query in query_list:
@@ -206,15 +225,33 @@ class BM25Retriever(BaseRetriever):
             return results
 
 
+def _set_faiss_ivf_nprobe(index, nprobe: int):
+    """Set nprobe for FAISS IVF index (or wrapped IndexPreTransform). No-op for Flat index."""
+    try:
+        if hasattr(index, "nprobe"):
+            index.nprobe = nprobe
+            return
+        if hasattr(index, "index"):  # e.g. IndexPreTransform
+            inner = faiss.downcast_index(index.index)
+            if hasattr(inner, "nprobe"):
+                inner.nprobe = nprobe
+    except Exception:
+        pass
+
+
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
         self.index = faiss.read_index(self.index_path)
+        if getattr(config, "faiss_nprobe", None) is not None:
+            _set_faiss_ivf_nprobe(self.index, config.faiss_nprobe)
         if config.faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
             co.shard = True
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+            if getattr(config, "faiss_nprobe", None) is not None:
+                _set_faiss_ivf_nprobe(self.index, config.faiss_nprobe)
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(
@@ -240,7 +277,13 @@ class DenseRetriever(BaseRetriever):
         else:
             return results
 
-    def _batch_search(self, query_list: list[str], num: int = None, return_score: bool = False):
+    def _batch_search(
+        self,
+        query_list: list[str],
+        num: int = None,
+        return_score: bool = False,
+        timing_out: Optional[dict] = None,
+    ):
         if isinstance(query_list, str):
             query_list = [query_list]
         if num is None:
@@ -249,9 +292,18 @@ class DenseRetriever(BaseRetriever):
         results = []
         scores = []
         idx_d = self.index.d
+        encode_s = 0.0
+        faiss_s = 0.0
+        load_docs_s = 0.0
+        retrieval_total_t0 = time.perf_counter()
+
         for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc="Retrieval process: "):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
+
+            t0 = time.perf_counter()
             batch_emb = self.encoder.encode(query_batch)
+            encode_s += time.perf_counter() - t0
+
             if batch_emb.ndim == 1:
                 batch_emb = batch_emb.reshape(1, -1)
             batch_emb = np.ascontiguousarray(batch_emb.astype(np.float32), dtype=np.float32)
@@ -261,13 +313,19 @@ class DenseRetriever(BaseRetriever):
                     "Index (e5_Flat.index) must match encoder (e.g. e5-large-v2=1024). "
                     "Ensure index and retrieval_model_path are from the same setup."
                 )
+
+            t0 = time.perf_counter()
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+            faiss_s += time.perf_counter() - t0
+
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
 
             # load_docs is not vectorized, but is a python list approach
             flat_idxs = sum(batch_idxs, [])
+            t0 = time.perf_counter()
             batch_results = load_docs(self.corpus, flat_idxs)
+            load_docs_s += time.perf_counter() - t0
             # chunk them back
             batch_results = [batch_results[i * num : (i + 1) * num] for i in range(len(batch_idxs))]
 
@@ -277,6 +335,13 @@ class DenseRetriever(BaseRetriever):
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
             if self.encoder.device == "cuda":
                 torch.cuda.empty_cache()
+
+        retrieval_total_s = time.perf_counter() - retrieval_total_t0
+        if timing_out is not None:
+            timing_out["encode_s"] = encode_s
+            timing_out["faiss_s"] = faiss_s
+            timing_out["load_docs_s"] = load_docs_s
+            timing_out["retrieval_total_s"] = retrieval_total_s
 
         if return_score:
             return results, scores
@@ -316,6 +381,7 @@ class Config:
         retrieval_query_max_length: int = 256,
         retrieval_use_fp16: bool = False,
         retrieval_batch_size: int = 128,
+        faiss_nprobe: Optional[int] = None,
     ):
         self.retrieval_method = retrieval_method
         self.retrieval_topk = retrieval_topk
@@ -329,6 +395,7 @@ class Config:
         self.retrieval_query_max_length = retrieval_query_max_length
         self.retrieval_use_fp16 = retrieval_use_fp16
         self.retrieval_batch_size = retrieval_batch_size
+        self.faiss_nprobe = faiss_nprobe
 
 
 class QueryRequest(BaseModel):
@@ -404,6 +471,12 @@ if __name__ == "__main__":
         "--retriever_model", type=str, default="intfloat/e5-large-v2", help="Path of the retriever model."
     )
     parser.add_argument("--faiss_gpu", action="store_true", help="Use GPU for computation")
+    parser.add_argument(
+        "--faiss_nprobe",
+        type=int,
+        default=128,
+        help="FAISS IVF nprobe: number of clusters to search (e.g. 128 or 512). Ignored for Flat index.",
+    )
 
     args = parser.parse_args()
 
@@ -420,6 +493,7 @@ if __name__ == "__main__":
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
         retrieval_batch_size=512,
+        faiss_nprobe=args.faiss_nprobe,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.

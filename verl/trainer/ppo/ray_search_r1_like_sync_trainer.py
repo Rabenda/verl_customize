@@ -67,6 +67,30 @@ def _normalize_query_list(raw_query_list: Any) -> list[str]:
     return [query for query in query_strings if query]
 
 
+def _doc_token_lengths_from_tool_results(tool_results: list[str], tokenizer) -> list[list[int]]:
+    """Parse tool_results (JSON with 'result'), split by doc separator, tokenize each doc; return per-sample list of doc token lengths."""
+    out: list[list[int]] = []
+    for raw in tool_results:
+        try:
+            obj = json.loads(raw)
+            text = obj.get("result", "") or ""
+        except (json.JSONDecodeError, TypeError):
+            text = ""
+        if not text.strip():
+            out.append([0])
+            continue
+        segments = [s.strip() for s in text.split("\n---\n") if s.strip()]
+        if not segments:
+            out.append([0])
+            continue
+        lengths = []
+        for seg in segments:
+            ids = tokenizer.encode(seg, add_special_tokens=False)
+            lengths.append(len(ids))
+        out.append(lengths)
+    return out
+
+
 def _format_single_retrieval_result(retrieval_result: list[dict[str, Any]]) -> str:
     formatted = []
     for idx, doc in enumerate(retrieval_result):
@@ -314,18 +338,33 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
             retrieval_query_max_length=int(local_cfg.get("retrieval_query_max_length", 256)),
             retrieval_use_fp16=bool(local_cfg.get("retrieval_use_fp16", True)),
             retrieval_batch_size=int(local_cfg.get("retrieval_batch_size", 128)),
+            faiss_nprobe=local_cfg.get("faiss_nprobe"),
         )
         self._local_retriever = get_retriever(retriever_config)
         self._local_retriever_topk = retrieval_topk
         return self._local_retriever
 
-    def _run_local_search_batch(self, query_lists: list[list[str]]) -> list[str]:
+    def _run_local_search_batch(
+        self,
+        query_lists: list[list[str]],
+        return_timing: bool = False,
+    ):
+        """Run retrieval for all query_lists. If return_timing=True, return (output_texts, timing_dict)."""
         retriever = self._get_local_retriever()
         flat_queries = [query for query_list in query_lists for query in query_list]
         if not flat_queries:
-            return [json.dumps({"result": "No search queries provided."}, ensure_ascii=False) for _ in query_lists]
+            out = [json.dumps({"result": "No search queries provided."}, ensure_ascii=False) for _ in query_lists]
+            return (out, {"encode_s": 0.0, "faiss_s": 0.0, "load_docs_s": 0.0, "format_s": 0.0}) if return_timing else out
 
-        batch_results = retriever.batch_search(flat_queries, num=self._local_retriever_topk, return_score=False)
+        timing_out = {} if return_timing else None
+        batch_results = retriever.batch_search(
+            flat_queries,
+            num=self._local_retriever_topk,
+            return_score=False,
+            timing_out=timing_out,
+        )
+
+        format_t0 = time.perf_counter()
         output_texts = []
         offset = 0
         for query_list in query_lists:
@@ -338,6 +377,11 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
             if not tool_text:
                 tool_text = "No search results found."
             output_texts.append(json.dumps({"result": tool_text}, ensure_ascii=False))
+        format_s = time.perf_counter() - format_t0
+
+        if return_timing and timing_out is not None:
+            timing_out["format_s"] = format_s
+            return output_texts, timing_out
         return output_texts
 
     def _build_output_from_states(
@@ -454,6 +498,8 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
         tool_wall = 0.0
         turn_gen_times: list[float] = []
         turn_search_times: list[float] = []
+        turn_faiss_times: list[float] = []  # per turn: faiss_s only (for tool_times CSV)
+        turn_doc_token_lengths: list[list[int]] = []  # per turn: flattened list of doc token lengths
         active_indices = list(range(len(states)))
 
         try:
@@ -494,6 +540,7 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
                 if not handles:
                     turn_gen_times.append(time.perf_counter() - turn_gen_t0)
                     turn_search_times.append(0.0)
+                    turn_faiss_times.append(0.0)
                     break
 
                 active_handles = set(handles)
@@ -540,14 +587,40 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
                 if not next_query_indices:
                     turn_gen_times.append(time.perf_counter() - turn_gen_t0)
                     turn_search_times.append(0.0)
+                    turn_faiss_times.append(0.0)
                     break
 
                 print(f"[Search-R1 Sync] Turn {turn_num}: retrieval", flush=True)
                 tool_t0 = time.perf_counter()
-                tool_results = self._run_local_search_batch(next_query_lists)
+                tool_results, tool_timing = self._run_local_search_batch(next_query_lists, return_timing=True)
                 search_elapsed = time.perf_counter() - tool_t0
                 tool_wall += search_elapsed
                 turn_search_times.append(search_elapsed)
+                turn_faiss_times.append(float(tool_timing.get("faiss_s", 0.0)))
+
+                # 打印本 turn 的 tool call 分项耗时
+                encode_s = tool_timing.get("encode_s", 0.0)
+                faiss_s = tool_timing.get("faiss_s", 0.0)
+                load_docs_s = tool_timing.get("load_docs_s", 0.0)
+                format_s = tool_timing.get("format_s", 0.0)
+                retrieval_total_s = tool_timing.get("retrieval_total_s", 0.0)
+                print(
+                    f"[Search-R1 Sync] Turn {turn_num} tool_call breakdown: "
+                    f"encode_s={encode_s:.3f} faiss_s={faiss_s:.3f} load_docs_s={load_docs_s:.3f} "
+                    f"format_s={format_s:.3f} retrieval_total_s={retrieval_total_s:.3f} tool_call_total_s={search_elapsed:.3f}",
+                    flush=True,
+                )
+
+                # 1) 统计 tokenize 后每个 document 的 length（按 turn 汇总）
+                per_sample_doc_lens = _doc_token_lengths_from_tool_results(tool_results, self.tokenizer)
+                flat_lens = [l for lengths in per_sample_doc_lens for l in lengths]
+                turn_doc_token_lengths.append(flat_lens)
+                if flat_lens:
+                    n_docs = len(flat_lens)
+                    print(
+                        f"[Search-R1 Sync] Turn {turn_num} doc token lengths: n_docs={n_docs} mean={sum(flat_lens)/n_docs:.1f} max={max(flat_lens)} sum={sum(flat_lens)}",
+                        flush=True,
+                    )
 
                 parser_name = self.config.actor_rollout_ref.rollout.multi_turn.format
                 for idx, tool_text in zip(next_query_indices, tool_results, strict=True):
@@ -573,7 +646,52 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
 
         elapsed = time.perf_counter() - rollout_start
         n_turns = len(turn_gen_times)
-        print(f"[Search-R1 Sync] Done: {n_turns} turns, gen={sum(turn_gen_times):.3f}s, retrieval={sum(turn_search_times):.3f}s, wall={elapsed:.3f}s", flush=True)
+        # 2) 两个 turn 的 retrieval 时间：按 turn 列出
+        retrieval_turn_str = ",".join(f"t{i+1}={t:.3f}s" for i, t in enumerate(turn_search_times))
+        tool_call_total_s = sum(turn_search_times)
+        print(
+            f"[Search-R1 Sync] Done: {n_turns} turns, gen={sum(turn_gen_times):.3f}s, retrieval={tool_call_total_s:.3f}s ({retrieval_turn_str}), wall={elapsed:.3f}s",
+            flush=True,
+        )
+        print(
+            f"[Search-R1 Sync] tool_call_total_s (this step): {tool_call_total_s:.3f}s",
+            flush=True,
+        )
+        if turn_doc_token_lengths:
+            all_lens = [l for flat in turn_doc_token_lengths for l in flat]
+            if all_lens:
+                print(
+                    f"[Search-R1 Sync] Doc token length total: n_docs={len(all_lens)} mean={sum(all_lens)/len(all_lens):.1f} max={max(all_lens)}",
+                    flush=True,
+                )
+        # 将 document length & tool time 统计写入 CSV：使用单独的 doc_length_csv_dir，避免和 decoding length 混在一起
+        _doc_csv_dir = self.config.trainer.get("doc_length_csv_dir", None)
+        if _doc_csv_dir and turn_doc_token_lengths:
+            os.makedirs(_doc_csv_dir, exist_ok=True)
+            exp_name = getattr(self.config.trainer, "experiment_name", "run")
+            safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(exp_name))
+            step = self.global_steps
+
+            # 1) doc length 分布：length,turn,step
+            doc_csv_path = os.path.join(_doc_csv_dir, f"doc_lengths_{safe_name}.csv")
+            write_header = not os.path.exists(doc_csv_path) or os.path.getsize(doc_csv_path) == 0
+            with open(doc_csv_path, "a", newline="") as f:
+                if write_header:
+                    f.write("length,turn,step\n")
+                for turn_0, flat_lens in enumerate(turn_doc_token_lengths):
+                    turn_1based = turn_0 + 1
+                    for length in flat_lens:
+                        f.write(f"{length},{turn_1based},{step}\n")
+
+            # 2) 每个 turn 的 faiss 时间（仅 faiss_s，用于 MFU 图中间块）：time_s,turn,step
+            tool_csv_path = os.path.join(_doc_csv_dir, f"tool_times_{safe_name}.csv")
+            write_header_tool = not os.path.exists(tool_csv_path) or os.path.getsize(tool_csv_path) == 0
+            with open(tool_csv_path, "a", newline="") as f:
+                if write_header_tool:
+                    f.write("time_s,turn,step\n")
+                for turn_0, t in enumerate(turn_faiss_times):
+                    turn_1based = turn_0 + 1
+                    f.write(f"{t:.6f},{turn_1based},{step}\n")
         return self._build_output_from_states(
             states,
             elapsed=elapsed,
