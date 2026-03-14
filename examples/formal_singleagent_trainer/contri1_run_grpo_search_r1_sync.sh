@@ -4,7 +4,7 @@ GPUS=4
 
 PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
-TOOL_CONFIG="$CONFIG_PATH/tool_config/search_tool_config.yaml"
+TOOL_CONFIG="$CONFIG_PATH/tool_config/search_tool_config_hehua.yaml"
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HF_HOME="/data/huggingface_cache"
 # model_runner 的 inference step CSV 输出到此目录
@@ -23,11 +23,11 @@ python3 -m verl.trainer.main_ppo \
     data.train_batch_size=256 \
     data.val_batch_size=256 \
     data.max_prompt_length=4096 \
-    data.max_response_length=3000 \
+    data.max_response_length=4096 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=/data/muxserve/llama-3.1-8B-Instruct \
+    actor_rollout_ref.model.path=/data/muxserve/qwen3-4b \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -57,14 +57,15 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console"]' \
     trainer.trainer_class=verl.trainer.ppo.ray_search_r1_like_sync_trainer.SearchR1LikeSyncRayPPOTrainer \
     trainer.project_name='search_r1_like_sync_rl' \
-    trainer.experiment_name='qwen3_4b_search_r1_sync' \
+    trainer.experiment_name='qwen3_4b_search_r1_sync_nprobe128' \
     trainer.n_gpus_per_node=$GPUS \
     trainer.decoding_length_csv_dir=/workspace/repo/verl_sglang/verl_customize/formal_exp_data_decoding_length \
+    +trainer.doc_length_csv_dir=/workspace/repo/verl_sglang/verl_customize/formal_exp_data_doc_and_tool \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=0 \
     trainer.total_epochs=1 \
-    trainer.total_training_steps=1 \
+    trainer.total_training_steps=3 \
     trainer.balance_batch=false \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$TOOL_CONFIG" \
     "$@"
