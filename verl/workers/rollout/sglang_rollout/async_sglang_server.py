@@ -289,6 +289,7 @@ class SGLangHttpServer:
             "json_model_override_args": json.dumps({"quantization_config": fp8_block_quant_kwargs})
             if quantization == "fp8"
             else json.dumps({}),
+            "model_role": getattr(self.config, "model_role", None) or "",
             **engine_kwargs,
         }
 
@@ -891,7 +892,11 @@ class SGLangReplica(RolloutReplica):
                 else f"sglang_server_reward_{self.replica_rank}_{node_rank}_{suffix}"
             )
             env_vars = {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}
+            model_role = getattr(self.config, "model_role", None) or ""
+            print(f"SGLang Replica model_role: {model_role}")
+            env_vars["SGLANG_MODEL_ROLE"] = str(model_role)
             mps_pct = getattr(self.config, "mps_active_thread_percentage", 0)
+            print(f"SGLang Replica mps_pct: {mps_pct}")
             if mps_pct > 0:
                 env_vars.update({
                     "CUDA_MPS_PIPE_DIRECTORY": "/tmp/nvidia-mps",

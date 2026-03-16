@@ -1151,6 +1151,28 @@ class DualRayPPOTrainer:
         print(f"[LONGEST_RESP] {label} step={step} text:\n{text}", flush=True)
         print(f"[LONGEST_RESP] {label} step={step} --- end ---", flush=True)
 
+    def _print_unified_timing(self, step: int, timing_raw: dict):
+        """统一打印 rollout / reference(old_log+ref_log) / update_actor 时间，便于横向对比。"""
+        def _s(v):
+            return f"{v:.3f}s" if v is not None and v >= 0 else "n/a"
+        rollout_a = timing_raw.get("gen_a")
+        rollout_b = timing_raw.get("gen_b")
+        rollout_par = timing_raw.get("gen_parallel_wall")
+        old_a = timing_raw.get("old_log_prob_a")
+        old_b = timing_raw.get("old_log_prob_b")
+        ref_a = timing_raw.get("ref_log_prob_a")
+        ref_b = timing_raw.get("ref_log_prob_b")
+        ref_a = (old_a or 0) + (ref_a or 0) if (old_a or ref_a) else None
+        ref_b = (old_b or 0) + (ref_b or 0) if (old_b or ref_b) else None
+        upd_a = timing_raw.get("update_actor_a")
+        upd_b = timing_raw.get("update_actor_b")
+        if rollout_par is not None:
+            print(f"[TIMING] step={step} rollout_parallel={_s(rollout_par)}", flush=True)
+        else:
+            print(f"[TIMING] step={step} rollout_a={_s(rollout_a)} rollout_b={_s(rollout_b)}", flush=True)
+        print(f"[TIMING] step={step} reference_a={_s(ref_a)} reference_b={_s(ref_b)}", flush=True)
+        print(f"[TIMING] step={step} update_actor_a={_s(upd_a)} update_actor_b={_s(upd_b)}", flush=True)
+
     # -------------------------
     # One actor step
     # -------------------------
@@ -1167,15 +1189,14 @@ class DualRayPPOTrainer:
             gen_batch.meta_info["global_steps"] = self.global_steps
             gen_batch_output = gen_batch.repeat(repeat_times=actor_cfg.rollout.n, interleave=True)
 
-            with marked_timer(f"gen_{which}", timing_raw, color="red"):
-                t_rollout_start = time.perf_counter()
-                gen_batch_output = async_mgr.generate_sequences(gen_batch_output)
-                t_rollout_end = time.perf_counter()
-                ckpt_mgr.sleep_replicas()
-                timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
-                gen_batch_output.meta_info.pop("timing", None)
-
-            print(f"[ROLLOUT] wall_time={t_rollout_end - t_rollout_start:.3f}s which={which} step={self.global_steps}", flush=True)
+            # 显式 wall-clock：从 actor 发起 stream 到收到最后一个 token 的完整时间（不被 meta_info 覆盖）
+            t_rollout_start = time.perf_counter()
+            gen_batch_output = async_mgr.generate_sequences(gen_batch_output)
+            ckpt_mgr.sleep_replicas()
+            t_rollout_end = time.perf_counter()
+            timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
+            timing_raw[f"gen_{which}"] = t_rollout_end - t_rollout_start  # 最后写入，确保不被覆盖
+            gen_batch_output.meta_info.pop("timing", None)
         else:
             t0 = time.time()
             gen_batch_output = gen_batch_output_override
@@ -1317,18 +1338,7 @@ class DualRayPPOTrainer:
                 config=self.config.algorithm,
             )
 
-        # 在 _step_one_actor 末尾 return 前加：
-        if getattr(self, "profiler", None) is not None and self.profiler.enabled:
-            if self.profiler.verbose and self.profiler.print_rollout_each:
-                print(f"Rollout for {which} successfully finished")
-                # 只打印该 actor 本次 rollout 的关键段
-                keys = [f"gen_{which}", f"reward_{which}", f"old_log_prob_{which}",
-                        f"ref_log_prob_{which}", f"values_{which}", f"adv_{which}"]
-                msg = [f"[rollout-profile] which={which} global_step={self.global_steps}"]
-                for k in keys:
-                    if k in timing_raw:
-                        msg.append(f"{k}={timing_raw[k]*1000:.1f}ms")
-                print(" | ".join(msg))
+        # rollout/ref_log/update_actor 统一由 _print_unified_timing 在 step 结束时打印
 
         # ----- rollout length stats (min/max/mean) -----
         stats = rollout_token_stats_from_batch(batch, tokenizer=self.tokenizer)
@@ -1424,17 +1434,9 @@ class DualRayPPOTrainer:
 
                 with marked_timer("step", timing_raw):
                     batch_a, batch_b = DataProto.from_single_dict_two_copies(batch_dict)
-                    t_rollout_a0 = time.perf_counter()
-                    print(f"[FIT] rollout_a walltime_before={t_rollout_a0:.6f} step={self.global_steps}", flush=True)
                     batch_a, _ = self._step_one_actor("a", batch_a, timing_raw, metrics)
-                    t_rollout_a1 = time.perf_counter()
-                    print(f"[FIT] rollout_a walltime_after={t_rollout_a1:.6f} duration={t_rollout_a1 - t_rollout_a0:.3f}s step={self.global_steps}", flush=True)
                     self._print_longest_response("FIT_rollout_a", batch_a, self.global_steps)
-                    t_rollout_b0 = time.perf_counter()
-                    print(f"[FIT] rollout_b walltime_before={t_rollout_b0:.6f} step={self.global_steps}", flush=True)
                     batch_b, _ = self._step_one_actor("b", batch_b, timing_raw, metrics)
-                    t_rollout_b1 = time.perf_counter()
-                    print(f"[FIT] rollout_b walltime_after={t_rollout_b1:.6f} duration={t_rollout_b1 - t_rollout_b0:.3f}s step={self.global_steps}", flush=True)
                     self._print_longest_response("FIT_rollout_b", batch_b, self.global_steps)
 
                     if self.use_critic:
@@ -1471,6 +1473,8 @@ class DualRayPPOTrainer:
                         with marked_timer("update_weights_b", timing_raw, color="red"):
                             self.checkpoint_manager_b.update_weights()
 
+                self._print_unified_timing(self.global_steps, timing_raw)
+
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.test_freq > 0
@@ -1502,9 +1506,7 @@ class DualRayPPOTrainer:
                 # logger.log(data=metrics, step=self.global_steps)
 
                 if getattr(self, "profiler", None) is not None:
-                    rtprint(f"[{_ts()}] [FIT] before profiler.update step={self.global_steps}")
                     self.profiler.update(timing_raw=timing_raw, step=self.global_steps)
-                    rtprint(f"[{_ts()}] [FIT] after profiler.update step={self.global_steps}")
 
                 progress_bar.update(1)
                 self.global_steps += 1
@@ -1605,7 +1607,6 @@ class DualRayPPOTrainer:
                     t_gen1 = time.time()
 
                     timing_raw["gen_parallel_wall"] = t_gen1 - t_gen0
-                    print(f"[ROLLOUT] wall_time={t_gen1 - t_gen0:.3f}s (a+b parallel) step={self.global_steps}", flush=True)
 
                     # 把 vLLM timing 合进 timing_raw（否则你后面看不到 engine 内部细分）
                     timing_raw.update(gen_out_a.meta_info.get("timing", {}))
@@ -1694,10 +1695,10 @@ class DualRayPPOTrainer:
 
                 # logger.log(data=metrics, step=self.global_steps)
 
+                self._print_unified_timing(self.global_steps, timing_raw)
+
                 if getattr(self, "profiler", None) is not None:
-                    rtprint(f"[{_ts()}] [FIT_NAIVE] before profiler.update step={self.global_steps}")
                     self.profiler.update(timing_raw=timing_raw, step=self.global_steps)
-                    rtprint(f"[{_ts()}] [FIT_NAIVE] after profiler.update step={self.global_steps}")
 
                 progress_bar.update(1)
                 self.global_steps += 1
@@ -1707,7 +1708,7 @@ class DualRayPPOTrainer:
                     progress_bar.close()
                     return
 
-    def fit_overlap_decode(self, start_b_when_active_a_leq: int = 0, poll_timeout_ms: int = 20):
+    def fit_overlap_decode(self, start_b_when_active_a_leq: int = 1024, poll_timeout_ms: int = 20):
         import time
         import uuid
         import numpy as np
@@ -1945,7 +1946,6 @@ class DualRayPPOTrainer:
                         active_a_count = int(group_status_a.get("active_count", active_a_count))
                         if active_a_count == 0 and t_a_done is None:
                             t_a_done = time.perf_counter()
-                            print(f"[ROLLOUT] wall_time={t_a_done - t_rollout_a_wall0:.3f}s which=a step={self.global_steps}", flush=True)
 
                     if (not started_b) and (active_a_count <= start_b_when_active_a_leq):
                         print(f"[{_ts()}] [TRIGGER] start B (active_a={active_a_count})", flush=True)
@@ -1979,7 +1979,6 @@ class DualRayPPOTrainer:
                         active_b_count = int(group_status_b.get("active_count", active_b_count))
                         if active_b_count == 0 and t_b_done is None:
                             t_b_done = time.perf_counter()
-                            print(f"[ROLLOUT] wall_time={t_b_done - t_rollout_b_wall0:.3f}s which=b step={self.global_steps}", flush=True)
 
                     if not high_low_a["triggered"] and 0 < active_a_count < _hl_threshold:
                         high_low_a["triggered"] = True
@@ -2064,25 +2063,30 @@ class DualRayPPOTrainer:
                 self._print_longest_response("fit_overlap_decode_rollout_a", gen_out_a, self.global_steps)
                 self._print_longest_response("fit_overlap_decode_rollout_b", gen_out_b, self.global_steps)
 
-                print(f"[{_ts()}] [STEP] before _step_one_actor", flush=True)
-                t_train0 = time.perf_counter()
-
-                batch_a, _ = self._step_one_actor(
-                    "a", batch_a, {}, {}, gen_batch_output_override=gen_out_a
-                )
-                batch_b, _ = self._step_one_actor(
-                    "b", batch_b, {}, {}, gen_batch_output_override=gen_out_b
-                )
-
-                print(f"[{_ts()}] [STEP] update_actor / update_critic", flush=True)
-
-                self._update_actor("a", batch_a)
-                self._update_actor("b", batch_b)
-                t_train1 = time.perf_counter()
-
-                a_to_threshold = (t_b_trigger - t_a_start) if t_b_trigger is not None else None
+                timing_raw = {}
                 a_rollout_total = (t_a_done - t_a_start) if t_a_done is not None else None
                 b_rollout_total = (t_b_done - t_b_start) if (t_b_start is not None and t_b_done is not None) else None
+                if a_rollout_total is not None:
+                    timing_raw["gen_a"] = a_rollout_total
+                if b_rollout_total is not None:
+                    timing_raw["gen_b"] = b_rollout_total
+
+                t_train0 = time.perf_counter()
+                batch_a, _ = self._step_one_actor(
+                    "a", batch_a, timing_raw, {}, gen_batch_output_override=gen_out_a
+                )
+                batch_b, _ = self._step_one_actor(
+                    "b", batch_b, timing_raw, {}, gen_batch_output_override=gen_out_b
+                )
+                with marked_timer("update_actor_a", timing_raw, color="red"):
+                    self._update_actor("a", batch_a)
+                with marked_timer("update_actor_b", timing_raw, color="red"):
+                    self._update_actor("b", batch_b)
+                t_train1 = time.perf_counter()
+
+                self._print_unified_timing(self.global_steps, timing_raw)
+
+                a_to_threshold = (t_b_trigger - t_a_start) if t_b_trigger is not None else None
                 train_time = t_train1 - t_train0
                 step_total = t_train1 - t_step0
 
@@ -2174,7 +2178,7 @@ class DualRayPPOTrainer:
 
         # Threshold: start A train only when active B streams are no larger than this.
         start_a_when_active_b_leq = getattr(
-            self.config.trainer, "start_a_when_active_b_leq", 1024
+            self.config.trainer, "start_a_when_active_b_leq", 512
         )
         poll_timeout_ms = getattr(self.config.trainer, "overlap_poll_timeout_ms", 20)
 
@@ -2296,13 +2300,12 @@ class DualRayPPOTrainer:
 
                     # ── Phase 1: A rollout (sync, blocking) ──
                     t_a_roll0 = time.perf_counter()
-                    with marked_timer("gen_a", timing_raw):
-                        gen_out_a = mgr_a.generate_sequences(gen_a)
+                    gen_out_a = mgr_a.generate_sequences(gen_a)
                     t_a_roll1 = time.perf_counter()
-                    print(f"[ROLLOUT] wall_time={t_a_roll1 - t_a_roll0:.3f}s which=a step={self.global_steps}", flush=True)
                     self._print_longest_response("fit_overlap_b_rollout_a_train_rollout_a", gen_out_a, self.global_steps)
 
                     timing_raw.update(gen_out_a.meta_info.get("timing", {}))
+                    timing_raw["gen_a"] = t_a_roll1 - t_a_roll0  # wall: stream 开始到最后一个 token
                     gen_out_a.meta_info.pop("timing", None)
                     if "uid" in batch_a.non_tensor_batch:
                         gen_out_a.non_tensor_batch["uid"] = batch_a.non_tensor_batch["uid"]
@@ -2448,6 +2451,7 @@ class DualRayPPOTrainer:
                     else:
                         a_train_wall = 0.0
                     b_roll_wall = t_overlap1 - t_overlap0
+                    timing_raw["gen_b"] = b_roll_wall
                     overlap_time = min(a_train_wall, b_roll_wall) if a_train_wall > 0 else 0.0
                     b_extra_after_train = max(0.0, b_roll_wall - a_train_wall)
 
@@ -2521,10 +2525,10 @@ class DualRayPPOTrainer:
                 timing_raw["overlap"] = overlap_time
                 timing_raw["b_extra_after_train"] = b_extra_after_train
 
+                self._print_unified_timing(self.global_steps, timing_raw)
+
                 if getattr(self, "profiler", None) is not None:
-                    rtprint(f"[{_ts()}] [FIT_OVERLAP] before profiler.update step={self.global_steps}")
                     self.profiler.update(timing_raw=timing_raw, step=self.global_steps)
-                    rtprint(f"[{_ts()}] [FIT_OVERLAP] after profiler.update step={self.global_steps}")
 
                 progress_bar.update(1)
                 self.global_steps += 1

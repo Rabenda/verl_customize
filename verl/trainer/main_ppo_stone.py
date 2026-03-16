@@ -156,6 +156,8 @@ def _make_actor_cfg_from_shared(config, which: str):
     with open_dict(scoped):
         scoped.model.path = OmegaConf.select(config, path_key)
         scoped.rollout.n = OmegaConf.select(config, n_key)
+        scoped.rollout.model_role = which  # "a" or "b" for SGLang SGLANG_MODEL_ROLE
+        print(f"Scoped rollout model role: {scoped.rollout.model_role}")
 
         # keep a clean config: remove the dual-only keys if present
         # (some downstream strict config / struct mode may dislike unknown keys)
@@ -566,6 +568,7 @@ class TaskRunner:
                     rollout["n"] = n
             rollout.pop("n_a", None)
             rollout.pop("n_b", None)
+            rollout["model_role"] = which  # "a" or "b" for SGLang green context
             merged_dict["rollout"] = rollout
 
             # Critical: ensure actor._target_ exists (must come from base)
@@ -670,8 +673,9 @@ class TaskRunner:
             print(f"[FIT] using fit_naive_concurrent_rollout", flush=True)
             trainer.fit_naive_concurrent_rollout()
         elif fit_method == "overlap_decode":
-            print(f"[FIT] using fit_overlap_decode", flush=True)
-            trainer.fit_overlap_decode()
+            start_b_when = OmegaConf.select(config.trainer, "start_b_when_active_a_leq", default=1024)
+            print(f"[FIT] using fit_overlap_decode (start_b_when_active_a_leq={start_b_when})", flush=True)
+            trainer.fit_overlap_decode(start_b_when_active_a_leq=int(start_b_when))
         elif fit_method == "naive":
             print(f"[FIT] no overlap", flush=True)
             trainer.fit()

@@ -459,15 +459,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
+        # puzzRL
         # Init green context streams for SM partitioning
         self.green_streams = None
         self._green_resources = None
         self._green_sm_counts = []
-        gc_sm_env = os.environ.get("SGLANG_GREENCTX_SM", "")
-        if gc_sm_env and self.device != "cpu":
-            sm_counts = [int(x) for x in gc_sm_env.split(",") if x.strip()]
-            if sm_counts:
-                self.init_green_context(sm_counts)
+        gc_sm_env = os.environ.get("SGLANG_GREENCTX_SM", "32")
+        print(f"Green Context strategy mode: {os.environ.get('SGLANG_GREENCTX_ALGO', 'default')}")
+        if os.environ.get('SGLANG_GREENCTX_ALGO', 'default') != "default":
+            if gc_sm_env and self.device != "cpu":
+                sm_counts = [int(x) for x in gc_sm_env.split(",") if x.strip()]
+                print("puzzRL: sm_counts: ", sm_counts)
+                if sm_counts:
+                    self.init_green_context(sm_counts)
+
+        # Model role for dual model (VERL): "a", "b", or "" when not set
+        self.model_role = getattr(server_args, "model_role", None) or os.environ.get("SGLANG_MODEL_ROLE", "")
+        print(f"Current model role: {self.model_role}")
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -2485,6 +2493,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._green_resources = None
         self._green_sm_counts = []
 
+    # PuzzRL
+    # Select green stream based on model role
     def _select_green_stream(self, forward_batch: ForwardBatch):
         """Select stream for green context. Returns None to use default stream (100% SM)."""
         if self.green_streams is None:
@@ -2495,13 +2505,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if algo == "naive":
             return self.green_streams[0]
         if algo == "prefill_decode":
-            has_prefill = (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
-                or forward_batch.forward_mode.is_split_prefill()
-            )
-            if has_prefill:
-                return None  # 100%
-            return self.green_streams[0]
+            # has_prefill = (
+            #     forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            #     or forward_batch.forward_mode.is_split_prefill()
+            # )
+            # if has_prefill:
+            #     return None  # 100%
+            # print("No prefill, using model role: ", self.model_role, "green_streams num: ", 0 if self.model_role == "a" else 1 if self.model_role == "b" else None)
+            return self.green_streams[0] if self.model_role == "a" else self.green_streams[1] if self.model_role == "b" else None
         return None
 
     def forward(

@@ -171,6 +171,8 @@ class RolloutConfig(BaseConfig):
 
     # For dual model serving
     server_name_suffix: Optional[str] = None
+    # model_role: "a" or "b" for dual model; passed to SGLang as SGLANG_MODEL_ROLE
+    model_role: Optional[str] = None
     mps_active_thread_percentage: int = 50
 
     # TODO: enable train_kwargs

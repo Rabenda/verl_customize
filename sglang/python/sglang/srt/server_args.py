@@ -294,6 +294,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
+    model_role: str = ""  # VERL dual model: "a", "b", or "" for single model
 
     # HTTP server
     host: str = "127.0.0.1"

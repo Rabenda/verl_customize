@@ -128,6 +128,9 @@ trainer:
   # Fit method for dual model training: overlap_decode, overlap_b_rollout_a_train, naive
   fit_method: overlap_decode
 
+  # [overlap_decode] Start B rollout when active A streams <= this. Default 1024. Set to batch_size to start B immediately after A begins.
+  start_b_when_active_a_leq: 1024
+
   # Optional fully qualified trainer class name. Defaults to RayPPOTrainer.
   trainer_class: null
 
