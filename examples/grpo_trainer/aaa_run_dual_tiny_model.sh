@@ -7,16 +7,16 @@ set -x
 python3 -m verl.trainer.main_ppo_stone \
   trainer.dual_model=true \
   algorithm.adv_estimator=grpo \
-  data.train_files=/data/verl/gsm8k/train.parquet \
-  data.val_files=/data/verl/gsm8k/test.parquet \
-  data.train_batch_size=256 \
+  data.train_files=/data/gsm8k/train.parquet \
+  data.val_files=/data/gsm8k/test.parquet \
+  data.train_batch_size=128 \
   data.max_prompt_length=512 \
-  data.max_response_length=2048 \
+  data.max_response_length=8192 \
   data.filter_overlong_prompts=True \
   data.truncation='error' \
   \
-  +actor_rollout_ref_a.model.path=/data/muxserve/qwen3-0.6b \
-  +actor_rollout_ref_b.model.path=/data/muxserve/qwen3-0.6b \
+  +actor_rollout_ref_a.model.path=Qwen/Qwen3-0.6B \
+  +actor_rollout_ref_b.model.path=Qwen/Qwen3-0.6B \
   \
   +actor_rollout_ref_a.actor.optim.lr=1e-6 \
   +actor_rollout_ref_b.actor.optim.lr=1e-6 \
@@ -24,8 +24,8 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.model.use_remove_padding=True \
   +actor_rollout_ref_b.model.use_remove_padding=True \
   \
-  +actor_rollout_ref_a.actor.ppo_mini_batch_size=256 \
-  +actor_rollout_ref_b.actor.ppo_mini_batch_size=256 \
+  +actor_rollout_ref_a.actor.ppo_mini_batch_size=128 \
+  +actor_rollout_ref_b.actor.ppo_mini_batch_size=128 \
   \
   +actor_rollout_ref_a.actor.ppo_micro_batch_size_per_gpu=8 \
   +actor_rollout_ref_b.actor.ppo_micro_batch_size_per_gpu=8 \
@@ -60,8 +60,11 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.rollout.name=vllm \
   +actor_rollout_ref_b.rollout.name=vllm \
   \
-  +actor_rollout_ref_a.rollout.gpu_memory_utilization=0.15 \
-  +actor_rollout_ref_b.rollout.gpu_memory_utilization=0.15 \
+  +actor_rollout_ref_a.rollout.gpu_memory_utilization=0.2 \
+  +actor_rollout_ref_b.rollout.gpu_memory_utilization=0.2 \
+  \
+  +actor_rollout_ref_a.rollout.mps_active_thread_percentage=50 \
+  +actor_rollout_ref_b.rollout.mps_active_thread_percentage=50 \
   \
   +actor_rollout_ref_a.rollout.n=8 \
   +actor_rollout_ref_b.rollout.n=8 \
