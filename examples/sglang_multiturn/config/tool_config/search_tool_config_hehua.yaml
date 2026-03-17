@@ -18,8 +18,8 @@ tools:
         retrieval_batch_size: 512
         retrieval_use_fp16: true
         faiss_gpu: false
-        # FAISS IVF nprobe: 搜索时探测的聚类数，512 或 128，召回/速度权衡
-        faiss_nprobe: 128
+        # FAISS IVF nprobe: 搜索时探测的聚类数，32/128/512，召回/速度权衡
+        faiss_nprobe: 32
       num_workers: 120
       rate_limit: 120
       timeout: 90

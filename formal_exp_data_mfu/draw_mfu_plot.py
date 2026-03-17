@@ -28,6 +28,8 @@ MODEL_CONFIGS = {
     "Qwen3-4B-instruct": {"params_b": 3.96, "num_layers": 40, "hidden_size": 2560},
     "Llama-3.1-8B":     {"params_b": 8.03, "num_layers": 32, "hidden_size": 4096},
     "Qwen3-8B":         {"params_b": 7.61, "num_layers": 28, "hidden_size": 3584},
+    "Qwen3-30B-A3B-Thinking-2507": {"params_b": 30.5, "num_layers": 48, "hidden_size": 2048},  # HF Qwen3 MoE 30.5B total, 8 active
+    "Qwen3-32B": {"params_b": 32.0, "num_layers": 64, "hidden_size": 5120},  # HF Qwen3-32B config.json
 }
 
 class MFUMonitor:
@@ -65,6 +67,8 @@ def _infer_dataset_and_turn(csv_path):
         dataset = "gsm8k"
     elif "math" in path_lower:
         dataset = "math"
+    elif "aime" in path_lower:
+        dataset = "aime"
     else:
         dataset = "unknown"
     return dataset, turn_type
@@ -85,6 +89,10 @@ def _infer_model_from_csv_path(csv_path):
         return "Qwen3-4B"
     if "qwen3-8b" in path_lower:
         return "Qwen3-8B"
+    if "qwen3-32b" in path_lower:
+        return "Qwen3-32B"
+    if "qwen3-30b-a3b" in path_lower or "30b-a3b-thinking" in path_lower:
+        return "Qwen3-30B-A3B-Thinking-2507"
     # 旧文件名兼容：qwen-* 映射到现有 Qwen3-* key
     if "qwen-0.6b" in path_lower:
         return "Qwen3-0.6B"
