@@ -86,7 +86,7 @@ def _plot_single_row(ax_row, base_dir: str, hardware: str, env_window: int, sigm
         "Qwen3-4B | GSM8K",
         "Qwen3-4B-instruct | GSM8K",
         "Qwen3-4B-instruct | MATH",
-        "Qwen3-32B | GSM8K",
+        "Qwen3-32B | GSM8K (bs256)",
     ]
     for col, (fname, model_name, dataset) in enumerate(SINGLE_FILES):
         ax = ax_row[col]

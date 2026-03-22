@@ -47,7 +47,7 @@ FILES: List[Tuple[str, str, str]] = [
     ("inference_step_log_gsm8k_qwen3-4b.csv", "Qwen3-4B", "GSM8K"),
     ("inference_step_log_gsm8k_qwen3-4b-instruct.csv", "Qwen3-4B-instruct", "GSM8K"),
     ("inference_step_log_math_qwen3-4b-instruct.csv", "Qwen3-4B-instruct", "MATH"),
-    ("inference_step_log_gsm8k_qwen3-32b.csv", "Qwen3-32B", "GSM8K"),
+    ("inference_step_log_gsm8k_qwen3-32b-bs256.csv", "Qwen3-32B", "GSM8K"),
 ]
 
 
