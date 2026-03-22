@@ -1894,9 +1894,6 @@ class RayPPOTrainer:
 
                 progress_bar.update(1)
                 self.global_steps += 1
-                if self.global_steps > 5:
-                    print(f"OYHH_DEBUG: Reached 5 steps. Exiting.")
-                    os._exit(0)
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"

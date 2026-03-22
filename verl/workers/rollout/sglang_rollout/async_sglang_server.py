@@ -420,6 +420,21 @@ class SGLangHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
+        # Multi-turn / tool rollout can grow prompt_ids beyond max_model_len; left-truncate (keep tail / most recent tokens).
+        max_len = self.config.max_model_len
+        if max_len is not None and len(prompt_ids) > max_len:
+            n_before = len(prompt_ids)
+            if isinstance(prompt_ids, torch.Tensor):
+                prompt_ids = prompt_ids[-max_len:].contiguous()
+            else:
+                prompt_ids = prompt_ids[-max_len:]
+            logger.warning(
+                "Prompt length %d > max_model_len %d; truncated from the left (kept last %d tokens).",
+                n_before,
+                max_len,
+                max_len,
+            )
+
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
 
         if max_possible_tokens < 0:
@@ -573,6 +588,17 @@ class SGLangHttpServer:
     ) -> dict[str, Any]:
         if self.node_rank != 0:
             raise RuntimeError("start_generate_stream should only be called on node_rank 0")
+
+        max_len = self.config.max_model_len
+        if max_len is not None and len(prompt_ids) > max_len:
+            n_before = len(prompt_ids)
+            prompt_ids = prompt_ids[-max_len:]
+            logger.warning(
+                "start_generate_stream: prompt length %d > max_model_len %d; truncated from the left (kept last %d).",
+                n_before,
+                max_len,
+                max_len,
+            )
 
         actual_prompt_len = len(prompt_ids)
         max_possible_tokens = self.config.max_model_len - actual_prompt_len

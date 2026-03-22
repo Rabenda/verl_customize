@@ -27,7 +27,7 @@ FILES = [
     ("doc_lengths_qwen3_4b_search_r1_sync_nprobe128.csv", "Qwen3-4B", "nprobe128"),
     ("doc_lengths_llama3.1_8b_search_r1_sync_nprobe128.csv", "Llama-3.1-8B", "nprobe128"),
     ("doc_lengths_qwen3_4b_instruct_search_r1_sync_nprobe32.csv", "Qwen3-4B-instruct", "nprobe32"),
-    ("doc_lengths_qwen3_32b_search_r1_sync_nprobe32.csv", "Qwen3-32B", "nprobe32"),
+    ("doc_lengths_qwen3_32b_search_r1_sync_nprobe32_bs256.csv", "Qwen3-32B", "nprobe32"),
 ]
 
 
