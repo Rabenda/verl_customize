@@ -407,8 +407,8 @@ class SGLangHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def clear_kv_cache(self):
-        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
-        await self.tokenizer_manager.release_memory_occupation(obj, None)
+        self.tokenizer_manager.auto_create_handle_loop()
+        await self.tokenizer_manager.flush_cache()
 
     async def generate(
         self,
@@ -882,6 +882,11 @@ class SGLangReplica(RolloutReplica):
         )
         worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
         worker_node_ids = [worker_info[0] for worker_info in worker_infos]
+        print(
+            f"[SGLang GPU Pool] replica_rank={self.replica_rank} rollout_mode={self.rollout_mode} "
+            f"world_size={self.world_size} gpus_per_node={self.gpus_per_node} nnodes={self.nnodes} "
+            f"workers={len(self.workers)} worker_infos=(node_id, cuda_visible_devices)={worker_infos}"
+        )
         base_gpu_id = 0
         infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
         replica_world_size = infer_tp * self.config.pipeline_model_parallel_size
@@ -909,15 +914,21 @@ class SGLangReplica(RolloutReplica):
                     ),
                 )
             )
-
             node_id = worker_node_ids[node_rank * self.gpus_per_replica_node]
+            print(
+                f"[SGLang GPU Pool] replica={self.replica_rank} node_rank={node_rank} "
+                f"node_id={node_id} cuda_visible_devices={node_cuda_visible_devices}"
+            )
             suffix = getattr(self.config, "server_name_suffix", None) or "default"
             name = (
                 f"sglang_server_{self.replica_rank}_{node_rank}_{suffix}"
                 if not self.is_reward_model
                 else f"sglang_server_reward_{self.replica_rank}_{node_rank}_{suffix}"
             )
-            env_vars = {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}
+            env_vars = {
+                f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1",
+                visible_devices_keyword: node_cuda_visible_devices,
+            }
             model_role = getattr(self.config, "model_role", None) or ""
             print(f"SGLang Replica model_role: {model_role}")
             env_vars["SGLANG_MODEL_ROLE"] = str(model_role)
