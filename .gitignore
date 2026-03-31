@@ -133,5 +133,9 @@ outputs
 !formal_log/
 !formal_log/*.log
 
+# PuzzRL_IntroGraph/gpuuti 的对比日志需要提交，不忽略
+!PuzzRL_IntroGraph/gpuuti/
+!PuzzRL_IntroGraph/gpuuti/*.log
+
 # formal_plot 不纳入版本控制
 formal_plot/
