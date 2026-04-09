@@ -1,0 +1,17 @@
+tools:
+  - class_name: "verl.tools.math_tool.MathTool"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "calc_math_reward"
+        description: "A tool for calculating the reward of a math answer (1.0 if correct, 0.0 otherwise)."
+        parameters:
+          type: "object"
+          properties:
+            answer:
+              type: "string"
+              description: "The model's final answer (preferably within \\boxed{})."
+          required: ["answer"]
+
