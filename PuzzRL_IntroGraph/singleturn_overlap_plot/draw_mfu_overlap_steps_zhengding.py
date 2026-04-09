@@ -110,7 +110,7 @@ def main() -> None:
     parser.add_argument(
         "--csv",
         type=str,
-        default="inference_step_log_multiturn_gsm8k_qwen3-4b-instruct-10step.csv",
+        default="inference_step_log_gsm8k_qwen3-4b-instruct-12step.csv",
         help="CSV path (absolute or relative to this directory).",
     )
     parser.add_argument("--hardware", type=str, default="H100_SXM")
@@ -172,11 +172,23 @@ def main() -> None:
 
     fig, ax = plt.subplots(1, 1, figsize=(4.5, 3))
 
-    # 同一色系叠加，看重叠与相似度；step 越大 alpha 越深
-    base_color = (0.25, 0.55, 0.75)  # 蓝（对齐你之前的配色）
-    alphas = np.linspace(0.25, 0.95, num=len(series))
-    for (alpha, (step, t_arr, env)) in zip(alphas, series):
-        ax.plot(t_arr, env, color=base_color, alpha=float(alpha), linewidth=1.6, label=f"step {step}")
+    base_color = (0.25, 0.55, 0.75)
+
+    # 插值到公共时间轴，计算中心线（median）
+    common_t = np.linspace(0, max_t, 400)
+    interp_matrix = []
+    for (step, t_arr, env) in series:
+        interp_vals = np.interp(common_t, t_arr, env, left=0.0, right=0.0)
+        interp_matrix.append(interp_vals)
+    interp_matrix = np.array(interp_matrix)  # (n_steps, 400)
+    center_line = np.median(interp_matrix, axis=0)
+
+    # 背景线：各 step 曲线，透明、无 label
+    for (step, t_arr, env) in series:
+        ax.plot(t_arr, env, color=base_color, alpha=0.18, linewidth=1.2)
+
+    # 中心线
+    ax.plot(common_t, center_line, color=base_color, alpha=0.9, linewidth=1.2)
 
     ax.set_xlim(0, max_t)
     ax.set_ylim(bottom=0)
@@ -193,8 +205,6 @@ def main() -> None:
     ax.set_facecolor("white")
     fig.patch.set_facecolor("white")
 
-    # legend 放右上角，避免挡曲线（可以按需关掉）
-    ax.legend(fontsize=7, ncol=2, frameon=False, loc="upper right")
     plt.tight_layout()
 
     pic_dir = os.path.join(base_dir, "pic")

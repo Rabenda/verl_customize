@@ -2878,6 +2878,12 @@ class ServerArgs:
             required=True,
         )
         parser.add_argument(
+            "--model-role",
+            type=str,
+            default=ServerArgs.model_role,
+            help="VERL dual model role: 'a', 'b', or '' for single model.",
+        )
+        parser.add_argument(
             "--tokenizer-path",
             type=str,
             default=ServerArgs.tokenizer_path,

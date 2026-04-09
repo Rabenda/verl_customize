@@ -23,13 +23,28 @@ except ImportError:
 from draw_mfu_four_single_plot_zhengding import (  # type: ignore
     _parse_first_step_metrics as _parse_first_step_metrics_single,
     _smooth_envelope as _smooth_envelope_single,
-    FILES as SINGLE_FILES,
+    FILES as _SINGLE_FILES_BASE,
 )
+
+# 3x4 图专用：Qwen3-4B-instruct MATH 换用 gpuuti0.85 版本
+SINGLE_FILES = [
+    (fname, model, dataset) if (model, dataset) != ("Qwen3-4B-instruct", "MATH")
+    else ("inference_step_log_math_qwen3-4b-instruct_gpuuti0.85.csv", model, dataset)
+    for fname, model, dataset in _SINGLE_FILES_BASE
+]
+
 from draw_mfu_four_multiturn_plot_zhengding import (  # type: ignore
     _parse_first_step_metrics as _parse_first_step_metrics_multiturn,
     _smooth_envelope as _smooth_envelope_multiturn,
-    FILES as MULTITURN_FILES,
+    FILES as _MULTITURN_FILES_BASE,
 )
+
+# 3x4 图专用：32B 换用 GSM8K gpuuti0.85 版本
+MULTITURN_FILES = [
+    (fname, model, dataset) if model != "Qwen3-32B"
+    else ("inference_step_log_multiturn_aime_qwen3-32b.csv", "Qwen3-32B", "AIME")
+    for fname, model, dataset in _MULTITURN_FILES_BASE
+]
 
 # search-r1 复用现有逻辑（含 faiss 灰块与 turn 分段）
 from draw_mfu_four_plot_zhengding import (  # type: ignore
@@ -45,11 +60,22 @@ from draw_mfu_four_plot_zhengding import (  # type: ignore
 )
 
 
-MODEL_COLORS_SOLID = {
-    "Qwen3-4B": (0.35, 0.65, 0.4),  # 绿
-    "Qwen3-4B-instruct": (0.85, 0.55, 0.2),  # 橙
-    "Qwen3-32B": (0.6, 0.35, 0.65),  # 紫
+# 与 draw_3x1_combined_zhengding.py 对齐的 (model, dataset) → color 表
+# 不在表中的组合用黑色
+_COLOR_MAP = {
+    ("Qwen3-4B",          "GSM8K"):            (0.35, 0.65, 0.4),   # 绿
+    ("Qwen3-4B",          "MATH"):             (0.7,  0.35, 0.3),   # 红
+    ("Qwen3-4B-instruct", "GSM8K"):            (0.25, 0.55, 0.75),  # 蓝
+    ("Qwen3-4B-instruct", "MATH"):             (0.85, 0.55, 0.2),   # 橙
+    ("Qwen3-32B",         "AIME"):              (0.6,  0.35, 0.65),  # 紫（对齐 3x1 Row1）
+    ("Qwen3-32B",         "GSM8K"):             (0.6,  0.35, 0.65),  # 紫
+    ("Qwen3-32B",         "Search-R1 faiss32"): (0.3,  0.65, 0.75), # 青（对齐 3x1 Row2）
 }
+_GRAY = (0.65, 0.65, 0.65)
+
+
+def _get_color(model: str, dataset: str) -> tuple:
+    return _COLOR_MAP.get((model, dataset), _GRAY)
 
 
 def _setup_ax(ax):
@@ -74,19 +100,35 @@ def _compute_peak_envelope(vals: np.ndarray, env_window: int, sigma: int) -> np.
         start = max(0, i - env_window)
         m = float(np.max(vals[start : i + 1]))
         peak[i] = m if m > 0.01 else 0.0
-    smooth = smooth_fn(peak, sigma)
-    for i in range(len(vals)):
-        if peak[i] == 0:
-            smooth[i] = 0
+    if sigma and sigma > 0:
+        smooth = smooth_fn(peak, sigma)
+        for i in range(len(vals)):
+            if peak[i] == 0:
+                smooth[i] = 0
+    else:
+        smooth = peak
     return smooth
 
 
-def _plot_single_row(ax_row, base_dir: str, hardware: str, env_window: int, sigma: int, min_prefill_tokens: int):
+def _smooth_direct(vals: np.ndarray, sigma: int) -> np.ndarray:
+    """直接 Gaussian 平滑，保留 dip，不做 peak envelope。"""
+    if sigma and sigma > 0:
+        try:
+            from scipy.ndimage import gaussian_filter1d  # type: ignore
+            return gaussian_filter1d(vals.astype(float), sigma=sigma)
+        except ImportError:
+            k = max(3, int(sigma * 2) | 1)
+            return np.convolve(vals, np.ones(k) / k, mode="same")
+    return vals.copy()
+
+
+def _plot_single_row(ax_row, base_dir: str, hardware: str, env_window: int, sigma: int,
+                     min_prefill_tokens: int, metric: str):
     titles = [
         "Qwen3-4B | GSM8K",
-        "Qwen3-4B-instruct | GSM8K",
-        "Qwen3-4B-instruct | MATH",
-        "Qwen3-32B | GSM8K (bs256)",
+        "Qwen3-4B-Instruct | GSM8K",
+        "Qwen3-4B-Instruct | MATH",
+        "Qwen3-32B | MATH",
     ]
     for col, (fname, model_name, dataset) in enumerate(SINGLE_FILES):
         ax = ax_row[col]
@@ -102,27 +144,32 @@ def _plot_single_row(ax_row, base_dir: str, hardware: str, env_window: int, sigm
             continue
         monitor = MFUMonitor(hardware, model_name)
         times: List[float] = []
-        mfus: List[float] = []
+        vals: List[float] = []
         t = 0.0
         for m in metrics:
             t += m["delta_t"]
             times.append(t)
-            mfus.append(monitor.calculate_step_mfu(**m) * 100.0)
+            if metric == "mfu":
+                vals.append(monitor.calculate_step_mfu(**m) * 100.0)
+            else:
+                vals.append(float(m["decoding_batch_size"]))
         t_arr = np.array(times)
-        v_arr = np.array(mfus)
+        v_arr = np.array(vals)
         env = _smooth_envelope_single(v_arr, window=env_window, sigma=sigma)
-        color = MODEL_COLORS_SOLID.get(model_name, (0.25, 0.55, 0.75))
-        ax.plot(t_arr, env, color=color, linewidth=1.6)
-        ax.set_title(titles[col], fontsize=11, fontweight="bold")
+        color = _get_color(model_name, dataset)
+        lw = 3.2 if color != _GRAY else 1.6
+        ax.plot(t_arr, env, color=color, linewidth=lw)
+        ax.set_title(titles[col], fontsize=11)
         _setup_ax(ax)
 
 
-def _plot_multiturn_row(ax_row, base_dir: str, hardware: str, env_window: int, sigma: int, min_prefill_tokens: int):
+def _plot_multiturn_row(ax_row, base_dir: str, hardware: str, env_window: int, sigma: int,
+                        min_prefill_tokens: int, metric: str):
     titles = [
-        "Qwen3-4B | GSM8K (multi-turn)",
-        "Qwen3-4B | MATH (multi-turn)",
-        "Qwen3-4B-instruct | AIME (multi-turn)",
-        "Qwen3-32B | AIME (multi-turn)",
+        "Qwen3-4B | GSM8K",
+        "Qwen3-4B | MATH",
+        "Qwen3-4B-Instruct | AIME",
+        "Qwen3-32B | AIME",
     ]
     for col, (fname, model_name, dataset) in enumerate(MULTITURN_FILES):
         ax = ax_row[col]
@@ -138,27 +185,32 @@ def _plot_multiturn_row(ax_row, base_dir: str, hardware: str, env_window: int, s
             continue
         monitor = MFUMonitor(hardware, model_name)
         times: List[float] = []
-        mfus: List[float] = []
+        vals: List[float] = []
         t = 0.0
         for m in metrics:
             t += m["delta_t"]
             times.append(t)
-            mfus.append(monitor.calculate_step_mfu(**m) * 100.0)
+            if metric == "mfu":
+                vals.append(monitor.calculate_step_mfu(**m) * 100.0)
+            else:
+                vals.append(float(m["decoding_batch_size"]))
         t_arr = np.array(times)
-        v_arr = np.array(mfus)
+        v_arr = np.array(vals)
         env = _smooth_envelope_multiturn(v_arr, window=env_window, sigma=sigma)
-        color = MODEL_COLORS_SOLID.get(model_name, (0.25, 0.55, 0.75))
-        ax.plot(t_arr, env, color=color, linewidth=1.6)
-        ax.set_title(titles[col], fontsize=11, fontweight="bold")
+        color = _get_color(model_name, dataset)
+        lw = 3.2 if color != _GRAY else 1.6
+        ax.plot(t_arr, env, color=color, linewidth=lw)
+        ax.set_title(titles[col], fontsize=11)
         _setup_ax(ax)
 
 
-def _plot_search_r1_row(ax_row, base_dir: str, hardware: str, env_window: int, sigma: int, min_prefill_tokens: int):
+def _plot_search_r1_row(ax_row, base_dir: str, hardware: str, env_window: int, sigma: int,
+                        min_prefill_tokens: int, metric: str):
     titles = [
-        "Qwen3-4B | Search-R1 faiss128",
-        "Qwen3-4B | Search-R1 faiss32",
-        "Qwen3-4B-instruct | Search-R1 faiss32",
-        "Qwen3-32B | Search-R1 faiss32",
+        "Qwen3-4B | Faiss-128",
+        "Qwen3-4B | Faiss-32",
+        "Qwen3-4B-Instruct | Faiss-32",
+        "Qwen3-32B | Faiss-32",
     ]
     for col, file_entry in enumerate(SEARCH_R1_FILES):
         ax = ax_row[col]
@@ -178,14 +230,17 @@ def _plot_search_r1_row(ax_row, base_dir: str, hardware: str, env_window: int, s
             _setup_ax(ax)
             continue
 
-        times, mfus = [], []
+        times, vals = [], []
         t = 0.0
         for d in metrics:
             t += d["delta_t"]
             times.append(t)
-            mfus.append(monitor.calculate_step_mfu(**d))
+            if metric == "mfu":
+                vals.append(monitor.calculate_step_mfu(**d) * 100.0)
+            else:
+                vals.append(float(d["decoding_batch_size"]))
         times = np.array(times)
-        vals = np.array(mfus) * 100.0
+        vals = np.array(vals)
         smooth = _compute_peak_envelope(vals, env_window=env_window, sigma=sigma)
 
         tool_times_by_turn = {}
@@ -211,14 +266,14 @@ def _plot_search_r1_row(ax_row, base_dir: str, hardware: str, env_window: int, s
                     if b in row_to_metric:
                         boundary_metric_idxs.append(row_to_metric[b])
 
-        color = MODEL_COLORS_SOLID.get(model, (0.25, 0.55, 0.75))
+        color = _get_color(model, dataset)
+        zero_offset = MFU_ZERO_OFFSET_PCT if metric == "mfu" else 0.0
 
         # 有 turn 边界时：按段画，并在段间插 faiss 灰块
         if tool_times_by_turn and boundary_metric_idxs and len(times) > 0:
             splits = [0] + sorted(set(boundary_metric_idxs)) + [len(times)]
             splits = [x for x in splits if 0 <= x <= len(times)]
             if len(splits) >= 2:
-                zero_offset = MFU_ZERO_OFFSET_PCT
                 shift = 0.0
                 prev_shift = 0.0
                 prev_had_tool = False
@@ -249,13 +304,13 @@ def _plot_search_r1_row(ax_row, base_dir: str, hardware: str, env_window: int, s
                     if t_tool > 0:
                         x_full.extend([x_end + ramp_t, x_end + t_tool - ramp_t])
                         y_full.extend([zero_offset, zero_offset])
-                        ax.axvspan(x_end, x_end + t_tool, color="#7f8c8d", alpha=0.35, linewidth=0, zorder=0.2)
+                        ax.axvspan(x_end, x_end + t_tool, color="#fff176", alpha=0.2, linewidth=0, zorder=0.2)
                         trans = blended_transform_factory(ax.transData, ax.transAxes)
                         ax.text(
                             x_end + t_tool / 2.0,
                             0.92,
-                            f"faiss t{turn_id}={t_tool:.2f}s",
-                            fontsize=8,
+                            f"Search Time\n({t_tool:.2f}s)",
+                            fontsize=9,
                             ha="center",
                             va="top",
                             color="#2c3e50",
@@ -269,24 +324,29 @@ def _plot_search_r1_row(ax_row, base_dir: str, hardware: str, env_window: int, s
                     prev_had_tool = (t_tool > 0)
                     shift = prev_shift
 
-                ax.plot(x_full, y_full, color=color, linewidth=1.4)
+                lw = 2.8 if color != _GRAY else 1.4
+                ax.plot(x_full, y_full, color=color, linewidth=lw)
             else:
-                ax.plot(times, smooth, color=color, linewidth=1.4)
+                lw = 2.8 if color != _GRAY else 1.4
+                ax.plot(times, smooth, color=color, linewidth=lw)
         else:
-            ax.plot(times, smooth, color=color, linewidth=1.4)
+            lw = 2.8 if color != _GRAY else 1.4
+            ax.plot(times, smooth, color=color, linewidth=lw)
 
-        ax.set_title(titles[col], fontsize=11, fontweight="bold")
+        ax.set_title(titles[col], fontsize=11)
         _setup_ax(ax)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="拼成 3x4：single / multiturn / search-r1 的 MFU 矢量图")
+    parser = argparse.ArgumentParser(description="拼成 3x4：single / multiturn / search-r1 图")
     parser.add_argument("-hw", "--hardware", default="H100_SXM")
+    parser.add_argument("--metric", choices=["mfu", "batch_size"], default="mfu",
+                        help="画 MFU(%%) 还是 Batch size（默认 mfu）")
     parser.add_argument("--single-env-window", type=int, default=40)
     parser.add_argument("--single-sigma", type=int, default=5)
-    parser.add_argument("--multiturn-env-window", type=int, default=40)
-    parser.add_argument("--multiturn-sigma", type=int, default=5)
-    parser.add_argument("--search-env-window", type=int, default=80)
+    parser.add_argument("--multiturn-env-window", type=int, default=500)
+    parser.add_argument("--multiturn-sigma", type=int, default=10)
+    parser.add_argument("--search-env-window", type=int, default=200)
     parser.add_argument("--search-sigma", type=int, default=20)
     parser.add_argument("--min-prefill-tokens", type=int, default=5000)
     parser.add_argument("--save", type=str, default=None, help="输出 PDF 路径（默认 pic/mfu_3x4.pdf）")
@@ -297,7 +357,7 @@ def main():
         return
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    fig, axes = plt.subplots(3, 4, figsize=(4.5 * 4, 3.0 * 3), sharey="row")
+    fig, axes = plt.subplots(3, 4, figsize=(2.5 * 4, 2 * 3), sharey="row")
 
     # row 0: single
     _plot_single_row(
@@ -307,6 +367,7 @@ def main():
         env_window=args.single_env_window,
         sigma=args.single_sigma,
         min_prefill_tokens=args.min_prefill_tokens,
+        metric=args.metric,
     )
     # row 1: multiturn
     _plot_multiturn_row(
@@ -316,6 +377,7 @@ def main():
         env_window=args.multiturn_env_window,
         sigma=args.multiturn_sigma,
         min_prefill_tokens=args.min_prefill_tokens,
+        metric=args.metric,
     )
     # row 2: search-r1
     _plot_search_r1_row(
@@ -325,12 +387,13 @@ def main():
         env_window=args.search_env_window,
         sigma=args.search_sigma,
         min_prefill_tokens=args.min_prefill_tokens,
+        metric=args.metric,
     )
 
-    # 每行的 y label，底行 x label
-    axes[0][0].set_ylabel("MFU (%)", fontsize=10)
-    axes[1][0].set_ylabel("MFU (%)", fontsize=10)
-    axes[2][0].set_ylabel("MFU (%)", fontsize=10)
+    ylabel = "MFU (%)" if args.metric == "mfu" else "Batch size"
+    axes[0][0].set_ylabel(ylabel, fontsize=10)
+    axes[1][0].set_ylabel(ylabel, fontsize=10)
+    axes[2][0].set_ylabel(ylabel, fontsize=10)
     for ax in axes[2]:
         ax.set_xlabel("Time (s)", fontsize=10)
 
@@ -338,8 +401,57 @@ def main():
         for c in range(4):
             axes[r][c].set_ylim(bottom=0)
 
+    # 所有子图黑框闭合
+    for r in range(3):
+        for c in range(4):
+            for spine in axes[r][c].spines.values():
+                spine.set_visible(True)
+                spine.set_edgecolor("black")
+                spine.set_linewidth(0.8)
+
     fig.patch.set_facecolor("white")
-    plt.tight_layout()
+
+    # ── 间距调节 ──────────────────────────────────────────────────────────────
+    WSPACE = 0.15   # 列间距（figure 坐标，tight_layout 后覆盖）
+    HSPACE = 0.65   # 行间距
+    # ──────────────────────────────────────────────────────────────────────────
+    plt.tight_layout(pad=0.8)
+    fig.subplots_adjust(wspace=WSPACE, hspace=HSPACE)
+
+    # 每行加独立灰色背景框，左上角偏白色字体标注 workload 类型
+    from matplotlib.patches import FancyBboxPatch
+    row_labels = ["Single-Turn", "Multi-Turn", "Search-R1"]
+
+    # ── Patch 大小调节 ────────────────────────────────────────────────────────
+    ROW_PAD_X = 0.018   # 灰框左右外扩（figure 坐标）
+    ROW_PAD_Y = 0.022   # 灰框上下外扩
+    # ──────────────────────────────────────────────────────────────────────────
+    for row_idx, label in enumerate(row_labels):
+        bboxes = [ax.get_position() for ax in axes[row_idx]]
+        x0 = min(b.x0 for b in bboxes) - ROW_PAD_X
+        x1 = max(b.x1 for b in bboxes) + ROW_PAD_X
+        y0 = min(b.y0 for b in bboxes) - ROW_PAD_Y
+        y1 = max(b.y1 for b in bboxes) + ROW_PAD_Y
+        rect = FancyBboxPatch(
+            (x0 - 0.03, y0 - 0.02), x1 - x0 + 0.03, y1 - y0 + 0.04,
+            boxstyle="round,pad=0.002",
+            transform=fig.transFigure,
+            facecolor=(0.93, 0.93, 0.93),
+            edgecolor="none",
+            zorder=0,
+            clip_on=False,
+        )
+        fig.add_artist(rect)
+        fig.text(
+            x0 - 0.03, y1 - 0.008 + 0.06,
+            label,
+            fontsize=11,
+            color=(0.72, 0.72, 0.72),
+            va="top",
+            ha="left",
+            fontweight="bold",
+            zorder=2,
+        )
 
     pic_dir = os.path.join(base_dir, "pic")
     os.makedirs(pic_dir, exist_ok=True)
@@ -351,4 +463,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

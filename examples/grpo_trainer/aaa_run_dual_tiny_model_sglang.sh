@@ -51,17 +51,11 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.actor.ppo_mini_batch_size=256 \
   +actor_rollout_ref_b.actor.ppo_mini_batch_size=256 \
   \
-  +actor_rollout_ref_a.actor.ppo_micro_batch_size_per_gpu=8 \
-  +actor_rollout_ref_b.actor.ppo_micro_batch_size_per_gpu=8 \
-  \
+  +actor_rollout_ref_a.actor.ppo_micro_batch_size_per_gpu=4 \
+  +actor_rollout_ref_b.actor.ppo_micro_batch_size_per_gpu=4 \
   +actor_rollout_ref_a.actor.use_kl_loss=True \
   +actor_rollout_ref_b.actor.use_kl_loss=True \
   \
-  +actor_rollout_ref_a.actor.kl_loss_coef=0.001 \
-  +actor_rollout_ref_b.actor.kl_loss_coef=0.001 \
-  \
-  +actor_rollout_ref_a.actor.kl_loss_type=low_var_kl \
-  +actor_rollout_ref_b.actor.kl_loss_type=low_var_kl \
   \
   +actor_rollout_ref_a.actor.entropy_coeff=0 \
   +actor_rollout_ref_b.actor.entropy_coeff=0 \
@@ -75,8 +69,8 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.actor.fsdp_config.optimizer_offload=True \
   +actor_rollout_ref_b.actor.fsdp_config.optimizer_offload=True \
   \
-  +actor_rollout_ref_a.rollout.log_prob_micro_batch_size_per_gpu=8 \
-  +actor_rollout_ref_b.rollout.log_prob_micro_batch_size_per_gpu=8 \
+  +actor_rollout_ref_a.rollout.log_prob_micro_batch_size_per_gpu=4 \
+  +actor_rollout_ref_b.rollout.log_prob_micro_batch_size_per_gpu=4 \
   \
   +actor_rollout_ref_a.rollout.tensor_model_parallel_size=$GPUS \
   +actor_rollout_ref_b.rollout.tensor_model_parallel_size=$GPUS \
@@ -96,8 +90,8 @@ python3 -m verl.trainer.main_ppo_stone \
   +actor_rollout_ref_a.rollout.n=4 \
   +actor_rollout_ref_b.rollout.n=4 \
   \
-  +actor_rollout_ref_a.ref.log_prob_micro_batch_size_per_gpu=8 \
-  +actor_rollout_ref_b.ref.log_prob_micro_batch_size_per_gpu=8 \
+  +actor_rollout_ref_a.ref.log_prob_micro_batch_size_per_gpu=4 \
+  +actor_rollout_ref_b.ref.log_prob_micro_batch_size_per_gpu=4 \
   \
   +actor_rollout_ref_a.ref.fsdp_config.param_offload=True \
   +actor_rollout_ref_b.ref.fsdp_config.param_offload=True \
