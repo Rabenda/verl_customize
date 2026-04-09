@@ -38,6 +38,22 @@ class Role(Enum):
     Env = 7
     ActorRolloutA = 8
     ActorRolloutB = 9
+    # Dual one-step-off roles: separate actor/rollout per model on dedicated pools
+    ActorA = 10    # Model-A actor (trains on pool_b)
+    RolloutA = 11  # Model-A rollout (infers on pool_a)
+    ActorB = 12    # Model-B actor (trains on pool_a)
+    RolloutB = 13  # Model-B rollout (infers on pool_b)
+    RefA = 14      # Model-A ref policy (pool_b, colocated with ActorA)
+    RefB = 15      # Model-B ref policy (pool_a, colocated with ActorB)
+    # Multi-model (N-way colocated) roles: index 0..7
+    ActorRolloutM0 = 16
+    ActorRolloutM1 = 17
+    ActorRolloutM2 = 18
+    ActorRolloutM3 = 19
+    ActorRolloutM4 = 20
+    ActorRolloutM5 = 21
+    ActorRolloutM6 = 22
+    ActorRolloutM7 = 23
 
     def __str__(self):
         return self._get_role_string()
@@ -53,6 +69,20 @@ class Role(Enum):
             Role.ActorRolloutRef: "actor_rollout_ref",
             Role.ActorRolloutA: "actor_rollout_a",
             Role.ActorRolloutB: "actor_rollout_b",
+            Role.ActorA: "actor_a",
+            Role.RolloutA: "rollout_a",
+            Role.ActorB: "actor_b",
+            Role.RolloutB: "rollout_b",
+            Role.RefA: "ref_a",
+            Role.RefB: "ref_b",
+            Role.ActorRolloutM0: "actor_rollout_m0",
+            Role.ActorRolloutM1: "actor_rollout_m1",
+            Role.ActorRolloutM2: "actor_rollout_m2",
+            Role.ActorRolloutM3: "actor_rollout_m3",
+            Role.ActorRolloutM4: "actor_rollout_m4",
+            Role.ActorRolloutM5: "actor_rollout_m5",
+            Role.ActorRolloutM6: "actor_rollout_m6",
+            Role.ActorRolloutM7: "actor_rollout_m7",
         }
         return role_mapping.get(self, self.name.lower())
 
@@ -68,6 +98,20 @@ class Role(Enum):
             "ref": cls.RefPolicy,
             "rm": cls.RewardModel,
             "actor_rollout_ref": cls.ActorRolloutRef,
+            "actor_a": cls.ActorA,
+            "rollout_a": cls.RolloutA,
+            "actor_b": cls.ActorB,
+            "rollout_b": cls.RolloutB,
+            "ref_a": cls.RefA,
+            "ref_b": cls.RefB,
+            "actor_rollout_m0": cls.ActorRolloutM0,
+            "actor_rollout_m1": cls.ActorRolloutM1,
+            "actor_rollout_m2": cls.ActorRolloutM2,
+            "actor_rollout_m3": cls.ActorRolloutM3,
+            "actor_rollout_m4": cls.ActorRolloutM4,
+            "actor_rollout_m5": cls.ActorRolloutM5,
+            "actor_rollout_m6": cls.ActorRolloutM6,
+            "actor_rollout_m7": cls.ActorRolloutM7,
         }
         role = string_mapping.get(name.lower())
         if role is None:

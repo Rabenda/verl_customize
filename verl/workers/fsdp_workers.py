@@ -188,11 +188,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_lora = self.config.model.get("lora_adapter_path") is not None or self._lora_rank > 0
 
         self.role = role
-        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
+        assert self.role in [
+            "actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref",
+            # dual trainer combined roles (ray_dual_trainer.py)
+            "actor_rollout_a", "actor_rollout_b",
+            # dual one-step-off separate roles (dual_ray_trainer.py)
+            "actor_a", "rollout_a", "actor_b", "rollout_b", "ref_a", "ref_b",
+        ]
 
-        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
-        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
-        self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._is_actor = self.role in [
+            "actor", "actor_rollout", "actor_rollout_ref",
+            "actor_rollout_a", "actor_rollout_b",
+            "actor_a", "actor_b",
+        ]
+        self._is_rollout = self.role in [
+            "rollout", "actor_rollout", "actor_rollout_ref",
+            "actor_rollout_a", "actor_rollout_b",
+            "rollout_a", "rollout_b",
+        ]
+        self._is_ref = self.role in ["ref", "actor_rollout_ref", "ref_a", "ref_b"]
         self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
 
         # TODO(haibin.lin):

@@ -125,11 +125,23 @@ trainer:
   # Whether to train two models simultaneously
   dual_model: False
 
-  # Fit method for dual model training: overlap_decode, overlap_b_rollout_a_train, naive
+  # Whether to train N models simultaneously (MultiRayPPOTrainer)
+  multi_model: False
+
+  # Number of co-located models for multi_model mode (2..8)
+  num_models: 2
+
+  # Fit method for dual/multi model training
   fit_method: overlap_decode
 
   # [overlap_decode] Start B rollout when active A streams <= this. Default 1024. Set to batch_size to start B immediately after A begins.
   start_b_when_active_a_leq: 1024
+
+  # [multi_overlap_decode] Streaming poll interval in ms
+  overlap_poll_timeout_ms: 20
+
+  # [multi_pipeline] Max concurrent sglang rollouts (others wait for train slot)
+  max_concurrent_rollout: 3
 
   # Optional fully qualified trainer class name. Defaults to RayPPOTrainer.
   trainer_class: null

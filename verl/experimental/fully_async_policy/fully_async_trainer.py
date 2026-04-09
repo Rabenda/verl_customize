@@ -349,11 +349,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # 1. waiting remaining validate task
         ray.get(self.param_synchronizer.wait_last_valid.remote())
         self._log_validation_data()
-        # 2. perform addtional parameter_sync and validate if trainer already updated
-        if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
+        # 2. perform additional parameter_sync and validate if trainer already updated
+        # Skip entirely when test_freq <= 0 (validate completely disabled)
+        do_final_validate = self.config.rollout.test_freq > 0
+        if do_final_validate and (
+            self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1
+        ):
             await self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
             ray.get(self.param_synchronizer.wait_last_valid.remote())
             self._log_validation_data()
+        elif self.local_trigger_step > 1:
+            # No validate, but still sync weights if there are pending training steps
+            await self._trigger_parameter_sync_after_step(validate=False, global_steps=self.global_steps)
         self.progress_bar.close()
 
         self._check_save_checkpoint(timing_raw)

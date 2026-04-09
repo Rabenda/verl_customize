@@ -419,6 +419,8 @@ class DualRayPPOTrainer:
 
             collate_fn = default_collate_fn
 
+        self._collate_fn = collate_fn  # saved for fit_async_pipeline to build dl_b
+
         num_workers = self.config.data["dataloader_num_workers"]
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
@@ -1155,9 +1157,9 @@ class DualRayPPOTrainer:
         """统一打印 rollout / reference(old_log+ref_log) / update_actor 时间，便于横向对比。"""
         def _s(v):
             return f"{v:.3f}s" if v is not None and v >= 0 else "n/a"
-        rollout_a = timing_raw.get("gen_a")
-        rollout_b = timing_raw.get("gen_b")
-        rollout_par = timing_raw.get("gen_parallel_wall")
+        rollout_a = timing_raw.get("puzzrl_rollout_a")
+        rollout_b = timing_raw.get("puzzrl_rollout_b")
+        rollout_par = timing_raw.get("puzzrl_rollout_parallel")
         old_a = timing_raw.get("old_log_prob_a")
         old_b = timing_raw.get("old_log_prob_b")
         ref_a = timing_raw.get("ref_log_prob_a")
@@ -1167,16 +1169,16 @@ class DualRayPPOTrainer:
         upd_a = timing_raw.get("update_actor_a")
         upd_b = timing_raw.get("update_actor_b")
         if rollout_par is not None:
-            print(f"[TIMING] step={step} rollout_parallel={_s(rollout_par)}", flush=True)
+            print(f"[TIMING] step={step} puzzrl_rollout_parallel={_s(rollout_par)}", flush=True)
         else:
-            print(f"[TIMING] step={step} rollout_a={_s(rollout_a)} rollout_b={_s(rollout_b)}", flush=True)
-        print(f"[TIMING] step={step} reference_a={_s(ref_a)} reference_b={_s(ref_b)}", flush=True)
-        print(f"[TIMING] step={step} update_actor_a={_s(upd_a)} update_actor_b={_s(upd_b)}", flush=True)
+            print(f"[TIMING] step={step} puzzrl_rollout_a={_s(rollout_a)} puzzrl_rollout_b={_s(rollout_b)}", flush=True)
+        print(f"[TIMING] step={step} puzzrl_reference_a={_s(ref_a)} puzzrl_reference_b={_s(ref_b)}", flush=True)
+        print(f"[TIMING] step={step} puzzrl_update_actor_a={_s(upd_a)} puzzrl_update_actor_b={_s(upd_b)}", flush=True)
 
     # -------------------------
     # One actor step
     # -------------------------
-    def _step_one_actor(self, which: str, batch: DataProto, timing_raw: dict, metrics: dict, gen_batch_output_override: Optional[DataProto] = None):
+    def _step_one_actor(self, which: str, batch: DataProto, timing_raw: dict, metrics: dict, gen_batch_output_override: Optional[DataProto] = None, _local_step: Optional[int] = None, skip_sleep: bool = False):
         actor_cfg = self._actor_cfg(which)
         async_mgr = self._async_mgr(which)
         ckpt_mgr = self._ckpt_mgr(which)
@@ -1195,17 +1197,22 @@ class DualRayPPOTrainer:
             ckpt_mgr.sleep_replicas()
             t_rollout_end = time.perf_counter()
             timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
-            timing_raw[f"gen_{which}"] = t_rollout_end - t_rollout_start  # 最后写入，确保不被覆盖
+            timing_raw[f"puzzrl_rollout_{which}"] = t_rollout_end - t_rollout_start  # 独立 key，不被 meta_info 污染
             gen_batch_output.meta_info.pop("timing", None)
         else:
-            t0 = time.time()
             gen_batch_output = gen_batch_output_override
-            ckpt_mgr.sleep_replicas()
-            timing_raw[f"gen_{which}"] = time.time() - t0
+            _disp_step = _local_step if _local_step is not None else self.global_steps
+            if skip_sleep:
+                rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: skip_sleep=True, skipping sleep_replicas")
+            else:
+                rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: sleep_replicas start")
+                ckpt_mgr.sleep_replicas()
+                rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: sleep_replicas done")
             timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
             gen_batch_output.meta_info.pop("timing", None)
-
-            rtprint(f"[rt] step={self.global_steps} gen_{which} override-done: {timing_raw[f'gen_{which}']:.2f}s")
+            # puzzrl_rollout_{which} 由 caller 设置，不覆盖
+            if f"puzzrl_rollout_{which}" in timing_raw:
+                rtprint(f"[rt] step={_disp_step} puzzrl_rollout_{which} override-done: {timing_raw[f'puzzrl_rollout_{which}']:.2f}s")
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
             if gen_batch_output_override is not None:
@@ -1270,7 +1277,9 @@ class DualRayPPOTrainer:
 
         assert not self.config.trainer.balance_batch
 
+        _disp_step = _local_step if _local_step is not None else self.global_steps
         reward_extra_infos_dict = {}
+        rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: reward start")
         with marked_timer(f"reward_{which}", timing_raw, color="yellow"):
             if self.use_rm and "rm_scores" not in batch.batch.keys():
                 assert self.reward_loop_manager is not None, "RewardLoopManager is None"
@@ -1282,6 +1291,7 @@ class DualRayPPOTrainer:
             else:
                 reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(batch, reward_fn=self.reward_fn, reward_for_val=False)
                 future_reward = None
+        rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: reward done  old_log_prob start")
 
         with marked_timer(f"old_log_prob_{which}", timing_raw, color="blue"):
             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(which, batch)
@@ -1302,17 +1312,21 @@ class DualRayPPOTrainer:
             )
             old_log_prob.batch.pop("entropys")
             batch = batch.union(old_log_prob)
+        rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: old_log_prob done")
 
         if self.config.algorithm.use_kl_in_reward:
+            rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: ref_log_prob start")
             with marked_timer(f"ref_log_prob_{which}", timing_raw, color="olive"):
                 ref_log_prob = self._compute_ref_log_prob_via_actor(which, batch)
                 batch = batch.union(ref_log_prob)
+            rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: ref_log_prob done")
 
         if self.use_critic:
             with marked_timer(f"values_{which}", timing_raw, color="cyan"):
                 values = self._compute_values(batch)
                 batch = batch.union(values)
 
+        rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: adv start")
         with marked_timer(f"adv_{which}", timing_raw, color="brown"):
             if future_reward is not None:
                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
@@ -1338,6 +1352,8 @@ class DualRayPPOTrainer:
                 config=self.config.algorithm,
             )
 
+        rtprint(f"[{which.upper()}] step={_disp_step} _step_one_actor: adv done  returning")
+
         # rollout/ref_log/update_actor 统一由 _print_unified_timing 在 step 结束时打印
 
         # ----- rollout length stats (min/max/mean) -----
@@ -1351,8 +1367,9 @@ class DualRayPPOTrainer:
             # 同时按需打印（跟 profiler 行一起看很直观）
             if getattr(self, "profiler", None) is not None and self.profiler.enabled:
                 if self.profiler.verbose and self.profiler.print_rollout_each:
+                    _disp_step = _local_step if _local_step is not None else self.global_steps
                     print(
-                        f"[rollout-len] {which} step={self.global_steps} "
+                        f"[rollout-len] {which} step={_disp_step} "
                         f"n={stats['rollout_tokens/n']} "
                         f"min={stats['rollout_tokens/min']} "
                         f"mean={stats['rollout_tokens/mean']:.1f} "
@@ -1606,7 +1623,7 @@ class DualRayPPOTrainer:
                         gen_out_b = fut_b.result()
                     t_gen1 = time.time()
 
-                    timing_raw["gen_parallel_wall"] = t_gen1 - t_gen0
+                    timing_raw["puzzrl_rollout_parallel"] = t_gen1 - t_gen0
 
                     # 把 vLLM timing 合进 timing_raw（否则你后面看不到 engine 内部细分）
                     timing_raw.update(gen_out_a.meta_info.get("timing", {}))
@@ -1614,13 +1631,14 @@ class DualRayPPOTrainer:
                     gen_out_a.meta_info.pop("timing", None)
                     gen_out_b.meta_info.pop("timing", None)
 
-                    # 关键：并发收益估算（需要 gen_a/gen_b 也被计到 timing_raw）
+                    # 关键：并发收益估算（用 meta_info 的 gen_a/gen_b 若存在）
                     ga = timing_raw.get("gen_a", None)
                     gb = timing_raw.get("gen_b", None)
-                    if ga is not None and gb is not None:
-                        speedup = (ga + gb) / max(timing_raw["gen_parallel_wall"], 1e-9)
+                    wall = timing_raw.get("puzzrl_rollout_parallel")
+                    if ga is not None and gb is not None and wall is not None:
+                        speedup = (ga + gb) / max(wall, 1e-9)
                         rtprint(f"[rt] step={self.global_steps} parallel_speedup≈{speedup:.2f}x "
-                                f"(gen_a+gen_b={(ga+gb)*1000:.1f}ms vs wall={timing_raw['gen_parallel_wall']*1000:.1f}ms)")
+                                f"(gen_a+gen_b={(ga+gb)*1000:.1f}ms vs wall={wall*1000:.1f}ms)")
 
                     if "uid" in batch_a.non_tensor_batch:
                         gen_out_a.non_tensor_batch["uid"] = batch_a.non_tensor_batch["uid"]
@@ -2067,9 +2085,9 @@ class DualRayPPOTrainer:
                 a_rollout_total = (t_a_done - t_a_start) if t_a_done is not None else None
                 b_rollout_total = (t_b_done - t_b_start) if (t_b_start is not None and t_b_done is not None) else None
                 if a_rollout_total is not None:
-                    timing_raw["gen_a"] = a_rollout_total
+                    timing_raw["puzzrl_rollout_a"] = a_rollout_total
                 if b_rollout_total is not None:
-                    timing_raw["gen_b"] = b_rollout_total
+                    timing_raw["puzzrl_rollout_b"] = b_rollout_total
 
                 t_train0 = time.perf_counter()
                 batch_a, _ = self._step_one_actor(
@@ -2113,6 +2131,567 @@ class DualRayPPOTrainer:
                     print("========== EXIT fit_overlap_decode ==========", flush=True)
                     progress_bar.close()
                     return
+
+    # =========================================================================
+    # fit_async_pipeline
+    #
+    # True async pipeline: A and B run as two independent threads, each looping:
+    #   rollout → [gpu_lock] → prep(reward+logprob+adv) → train → update_weights → [release]
+    #
+    # Key properties:
+    #   - A and B each have their OWN full-dataset dataloader and independent step counter.
+    #   - rollout is fully concurrent between A and B.
+    #   - PREP + TRAIN + UPDATE_WEIGHTS are all serialized under gpu_lock:
+    #     * PREP uses the ref model (FSDP) and pauses SGLang KV cache.
+    #     * update_weights calls get_per_tensor_param on FSDP actor workers; if it ran
+    #       outside the lock it would race with the other actor's PREP (old_log_prob also
+    #       uses FSDP actor workers) → Ray deadlock.
+    #   - update_weights must stay inside the lock for the above reason.
+    #   - A seeds the pipeline: B starts its first rollout only after A finishes its
+    #     first rollout, so A naturally gets the train lock first.
+    #
+    # Steady-state pipeline (R=rollout+prep, T=train, W=update_weights):
+    #   A: [R-1]──[T-1]──[W-1]──[R-2]──[T-2]──[W-2]──...
+    #   B:     ──[R-1]──────────[T-1]──[W-1]──[R-2]──...
+    #                   ^^^^^^^^^ T-1-A and T-1-B are serialized
+    #
+    # TODO: checkpoint (save_freq) and validation (test_freq) not yet supported
+    #       in this mode — set both to 0 or a very large value in your config.
+    # =========================================================================
+    def fit_async_pipeline(self):
+        import threading
+        from verl.utils.tracking import Tracking
+        from verl.trainer.main_ppo import create_rl_sampler
+
+        assert not self.use_critic, (
+            "fit_async_pipeline requires use_critic=False (pure GRPO). "
+            "Set critic.enable=false in your config."
+        )
+
+        _ts = lambda: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        # ── Init ────────────────────────────────────────────────────────────
+        rtprint(f"[{_ts()}] [FIT_ASYNC_INIT] _load_checkpoint start")
+        self._load_checkpoint()
+        rtprint(f"[{_ts()}] [FIT_ASYNC_INIT] _load_checkpoint done")
+        rtprint(f"[{_ts()}] [FIT_ASYNC_INIT] update_weights A start")
+        self.checkpoint_manager_a.update_weights()
+        rtprint(f"[{_ts()}] [FIT_ASYNC_INIT] update_weights A done — B deferred, ready to launch threads")
+        # NOTE: B's update_weights() is intentionally deferred — called in run_actor("b") after
+        # b_start_event fires (concurrent with A's first PREP+TRAIN+UPDATE_WEIGHTS cycle).
+        # If B were activated here, both sglang KV caches would be on GPU during A's first
+        # rollout, causing ~3x throughput degradation.
+
+        total_steps = self.total_training_steps
+
+        # ── Profiler ────────────────────────────────────────────────────────
+        prof_cfg = self.config.trainer.get("profile", {})
+        self.profiler = StepProfiler(
+            enabled=prof_cfg.get("enabled", True),
+            verbose=prof_cfg.get("verbose", True),
+            print_every=prof_cfg.get("print_every", 1),
+            window=prof_cfg.get("window", 1),
+            print_rollout_each=prof_cfg.get("print_rollout_each", True),
+        )
+
+        # ── Second dataloader for B (independent full-dataset iteration) ────
+        train_sampler_b = create_rl_sampler(self.config.data, self.train_dataset)
+        train_dl_b = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=self.config.data["dataloader_num_workers"],
+            drop_last=True,
+            collate_fn=self._collate_fn,
+            sampler=train_sampler_b,
+        )
+
+        # ── Synchronization primitives ──────────────────────────────────────
+        # train_lock: only one actor may call _update_actor at a time
+        train_lock = threading.Lock()
+        # log_lock: protect logger and profiler from concurrent access
+        log_lock = threading.Lock()
+        # b_start_event: B's first rollout begins only after A finishes its first,
+        #                so A naturally leads and gets the train lock first.
+        b_start_event = threading.Event()
+
+        fit_wall_start = time.perf_counter()
+        rtprint(f"[FIT_ASYNC] wall_start={_ts()}", )
+
+        # ── Per-actor worker function ────────────────────────────────────────
+        def run_actor(which: str, dataloader, start_event=None):
+            actor_cfg = self._actor_cfg(which)
+
+            if start_event is not None:
+                rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] waiting for A's first rollout to finish...")
+                start_event.wait()
+                rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] start signal received — calling update_weights to activate sglang")
+                # Activate B's sglang now (deferred from init to avoid KV-cache contention
+                # during A's first rollout). This runs concurrently with A's first
+                # PREP+TRAIN+UPDATE_WEIGHTS cycle (different FSDP worker groups → no deadlock).
+                _t0_b_uw = time.perf_counter()
+                self._ckpt_mgr(which).update_weights()
+                rtprint(
+                    f"[{_ts()}] [{which.upper()}-ASYNC] update_weights done"
+                    f"  wall={time.perf_counter()-_t0_b_uw:.3f}s — entering pipeline"
+                )
+
+            step = 0
+            first_iter = True
+
+            try:
+                for batch_dict in dataloader:
+                    step += 1
+                    timing_raw: dict = {}
+                    metrics: dict = {}
+                    t_step_start = time.perf_counter()
+
+                    rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] ── step={step} BEGIN ──")
+
+                    # ── Phase 1: Rollout ─────────────────────────────────────
+                    batch = DataProto.from_single_dict(batch_dict)
+                    batch.meta_info["temperature"] = actor_cfg.rollout.temperature
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
+
+                    gen_batch = self._get_gen_batch(batch)  # pops non-reward keys from batch
+                    gen_batch.meta_info["global_steps"] = step
+                    gen_batch_rep = gen_batch.repeat(repeat_times=actor_cfg.rollout.n, interleave=True)
+
+                    t0 = time.perf_counter()
+                    _b = gen_batch_rep.batch
+                    _shape_str = str(_b['input_ids'].shape) if (_b is not None and 'input_ids' in _b) else '?'
+                    rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] step={step} ROLLOUT start  "
+                            f"gen_batch_rep.input_ids.shape={_shape_str}")
+                    # Use inter-DP migration if enabled (DP=2 only)
+                    _migration_cfg = actor_cfg.rollout.get("dp_migration", {})
+                    _use_migration = (
+                        _migration_cfg.get("enable", False)
+                        and len(self._async_mgr(which).agent_loop_workers) == 2
+                        and len(self._async_mgr(which).server_addresses) >= 2
+                    )
+                    if _use_migration:
+                        _abort_dp_idx = _migration_cfg.get("abort_dp_idx", -1)
+                        gen_out = self._async_mgr(which).generate_sequences_with_migration(
+                            gen_batch_rep,
+                            migration_threshold=_migration_cfg.get("threshold", 32),
+                            abort_dp_idx=_abort_dp_idx,
+                            poll_interval=_migration_cfg.get("poll_interval", 0.3),
+                        )
+                    else:
+                        gen_out = self._async_mgr(which).generate_sequences(gen_batch_rep)
+                    # NOTE: do NOT call sleep_replicas() here — _step_one_actor already
+                    # calls it in the override branch (line ~1204). Double-sleeping
+                    # corrupts the SGLang KV-cache state and causes PREP to hang.
+                    t_rollout = time.perf_counter() - t0
+                    timing_raw[f"rollout_{which}"] = t_rollout
+                    timing_raw.update(gen_out.meta_info.get("timing", {}))
+                    gen_out.meta_info.pop("timing", None)
+                    # Log migration stats if triggered
+                    _mig = gen_out.meta_info.get("dp_migration", {})
+                    if _mig.get("triggered"):
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-ASYNC] step={step} DP_MIGRATION triggered: "
+                            f"source=DP{_mig['source_idx']}(was {_mig['source_running_at_abort']} running) "
+                            f"→ target=DP{_mig['target_idx']}(was {_mig['target_running_at_abort']} running)"
+                        )
+                    _ob = gen_out.batch
+                    n_seqs = _ob['input_ids'].shape[0] if (_ob is not None and 'input_ids' in _ob) else '?'
+                    _tp_str = f"  throughput={n_seqs/t_rollout:.1f} seqs/s" if isinstance(n_seqs, int) else ""
+                    rtprint(
+                        f"[{_ts()}] [{which.upper()}-ASYNC] step={step} ROLLOUT done"
+                        f"  wall={t_rollout:.3f}s  n_seqs={n_seqs}{_tp_str}"
+                    )
+
+                    # Signal B to begin after A's very first rollout
+                    if first_iter and which == "a":
+                        b_start_event.set()
+                    first_iter = False
+
+                    # ── Phase 2+3: Prep + Train (serialized via gpu_lock) ──────
+                    # Lock covers PREP + TRAIN + UPDATE_WEIGHTS:
+                    # PREP uses the ref FSDP model and pauses SGLang KV cache; TRAIN mutates
+                    # weights; UPDATE_WEIGHTS calls get_per_tensor_param on FSDP actor workers.
+                    # Running any of these concurrently with the other actor causes Ray deadlock.
+                    # Only ROLLOUT is concurrent between A and B.
+                    t_wait_start = time.perf_counter()
+                    rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] step={step} PREP+TRAIN+UPDATE_WEIGHTS waiting for lock …")
+                    with train_lock:
+                        t_wait = time.perf_counter() - t_wait_start
+                        timing_raw[f"gpu_lock_wait_{which}"] = t_wait
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-ASYNC] step={step} PREP+TRAIN+UPDATE_WEIGHTS acquired lock"
+                            f"  (waited={t_wait:.3f}s)"
+                        )
+
+                        # PREP ──────────────────────────────────────────────────
+                        t0 = time.perf_counter()
+                        rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] step={step} PREP(reward+logprob+adv) start")
+                        batch, _ = self._step_one_actor(
+                            which, batch, timing_raw, metrics,
+                            gen_batch_output_override=gen_out,
+                            _local_step=step,
+                            skip_sleep=False,  # sleep_replicas() is required: update_weights() has
+                                               # a hard dependency on weights being in offload_tags
+                        )
+                        t_prep = time.perf_counter() - t0
+                        timing_raw[f"prep_{which}"] = t_prep
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-ASYNC] step={step} PREP done"
+                            f"  wall={t_prep:.3f}s"
+                            f"  (reward={timing_raw.get(f'reward_{which}', 0):.3f}s"
+                            f"  logprob={timing_raw.get(f'old_log_prob_{which}', 0):.3f}s"
+                            f"  ref={timing_raw.get(f'ref_log_prob_{which}', 0):.3f}s"
+                            f"  adv={timing_raw.get(f'adv_{which}', 0):.3f}s)"
+                        )
+
+                        # TRAIN ─────────────────────────────────────────────────
+                        t0 = time.perf_counter()
+                        rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] step={step} TRAIN start")
+                        actor_out = self._update_actor(which, batch)
+                        t_train = time.perf_counter() - t0
+                        timing_raw[f"update_actor_{which}"] = t_train
+                        metrics.update(reduce_metrics(actor_out.meta_info["metrics"]))
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-ASYNC] step={step} TRAIN done"
+                            f"  wall={t_train:.3f}s"
+                        )
+
+                        # UPDATE_WEIGHTS must be inside the lock: update_weights() calls
+                        # get_per_tensor_param on FSDP actor workers; if it ran outside the
+                        # lock it would race with the other actor's PREP (old_log_prob also
+                        # uses FSDP actor workers) → Ray deadlock.
+                        t0 = time.perf_counter()
+                        rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] step={step} UPDATE_WEIGHTS start")
+                        self._ckpt_mgr(which).update_weights()
+                        t_weights = time.perf_counter() - t0
+                        timing_raw[f"update_weights_{which}"] = t_weights
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-ASYNC] step={step} UPDATE_WEIGHTS done"
+                            f"  wall={t_weights:.3f}s — releasing lock"
+                        )
+
+                    # ── Step summary ──────────────────────────────────────────
+                    t_step = time.perf_counter() - t_step_start
+                    timing_raw[f"step_{which}"] = t_step
+                    rtprint(
+                        f"[{_ts()}] [{which.upper()}-ASYNC] step={step} SUMMARY"
+                        f"  rollout={t_rollout:.2f}s"
+                        f"  prep={t_prep:.2f}s"
+                        f"  lock_wait={t_wait:.2f}s"
+                        f"  train={t_train:.2f}s"
+                        f"  weights={t_weights:.2f}s"
+                        f"  step_wall={t_step:.2f}s"
+                        f"  fit_wall={time.perf_counter() - fit_wall_start:.2f}s"
+                    )
+
+                    # ── Metrics & logging ─────────────────────────────────────
+                    metrics[f"training/{which}/step"] = step
+                    metrics[f"timing/{which}/rollout"] = t_rollout
+                    metrics[f"timing/{which}/prep"] = t_prep
+                    metrics[f"timing/{which}/lock_wait"] = t_wait
+                    metrics[f"timing/{which}/train"] = t_train
+                    metrics[f"timing/{which}/update_weights"] = t_weights
+                    metrics[f"timing/{which}/step_wall"] = t_step
+                    metrics.update(
+                        rename_dict(compute_data_metrics(batch=batch, use_critic=False), f"data_{which}/")
+                    )
+
+                    with log_lock:
+                        logger.log(data=metrics, step=step)
+                        if getattr(self, "profiler", None) is not None:
+                            self.profiler.update(timing_raw=timing_raw, step=step, prefix=f"{which}_")
+
+                    if step >= total_steps:
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-ASYNC] reached total_steps={total_steps}, stopping."
+                        )
+                        break
+
+            except Exception as exc:
+                rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] EXCEPTION at step={step}: {exc}")
+                # Ensure b_start_event is always set so B doesn't hang if A crashes
+                if which == "a":
+                    b_start_event.set()
+                raise
+
+            rtprint(f"[{_ts()}] [{which.upper()}-ASYNC] ALL DONE — completed {step} steps")
+
+        # ── Launch threads ───────────────────────────────────────────────────
+        thread_a = threading.Thread(
+            target=run_actor, args=("a", self.train_dataloader, None),
+            name="actor_a", daemon=True,
+        )
+        thread_b = threading.Thread(
+            target=run_actor, args=("b", train_dl_b, b_start_event),
+            name="actor_b", daemon=True,
+        )
+
+        thread_a.start()
+        thread_b.start()
+
+        thread_a.join()
+        thread_b.join()
+
+        rtprint(
+            f"[FIT_ASYNC] wall_total={time.perf_counter() - fit_wall_start:.3f}s DONE"
+        )
+
+    # =========================================================================
+    # fit_parallel_pipeline
+    #
+    # Simultaneous parallel rollout: A and B both start rollout at t=0.
+    # Each monitors its own DP0+DP1 TOTAL load; when total drops below
+    # threshold, the designated DP is aborted:
+    #   Model A: abort_dp_idx=1  → consolidate onto DP0 (GPU pair 0)
+    #   Model B: abort_dp_idx=0  → consolidate onto DP1 (GPU pair 1)
+    # After both migrations: A and B occupy disjoint GPU pairs → zero MPS
+    # competition on the rollout tail.
+    # PREP+TRAIN still serialized via train_lock; the other model's rollout
+    # continues concurrently on its own GPU pair.
+    #
+    # Config (per model):
+    #   rollout.dp_migration.enable          = true
+    #   rollout.dp_migration.total_threshold = 32     # total (DP0+DP1) trigger
+    #   rollout.dp_migration.abort_dp_idx    = 1 / 0  # A=1, B=0
+    #   rollout.dp_migration.poll_interval   = 0.3
+    # =========================================================================
+    def fit_parallel_pipeline(self):
+        import threading
+        from verl.utils.tracking import Tracking
+        from verl.trainer.main_ppo import create_rl_sampler
+
+        assert not self.use_critic, (
+            "fit_parallel_pipeline requires use_critic=False (pure GRPO)."
+        )
+
+        _ts = lambda: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        # ── Init: activate BOTH models simultaneously ────────────────────────
+        # Both SGLang KV caches go live on GPU from t=0 (MPS competition is
+        # intentional — migration will consolidate each model to its own GPU pair).
+        rtprint(f"[{_ts()}] [FIT_PARALLEL_INIT] _load_checkpoint start")
+        self._load_checkpoint()
+        rtprint(f"[{_ts()}] [FIT_PARALLEL_INIT] update_weights A start")
+        self.checkpoint_manager_a.update_weights()
+        rtprint(f"[{_ts()}] [FIT_PARALLEL_INIT] update_weights A done — activating B immediately")
+        self.checkpoint_manager_b.update_weights()
+        rtprint(f"[{_ts()}] [FIT_PARALLEL_INIT] update_weights B done — both models active")
+
+        total_steps = self.total_training_steps
+
+        prof_cfg = self.config.trainer.get("profile", {})
+        self.profiler = StepProfiler(
+            enabled=prof_cfg.get("enabled", True),
+            verbose=prof_cfg.get("verbose", True),
+            print_every=prof_cfg.get("print_every", 1),
+            window=prof_cfg.get("window", 1),
+            print_rollout_each=prof_cfg.get("print_rollout_each", True),
+        )
+
+        train_sampler_b = create_rl_sampler(self.config.data, self.train_dataset)
+        train_dl_b = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=self.config.data["dataloader_num_workers"],
+            drop_last=True,
+            collate_fn=self._collate_fn,
+            sampler=train_sampler_b,
+        )
+
+        train_lock = threading.Lock()
+        log_lock   = threading.Lock()
+        fit_wall_start = time.perf_counter()
+        rtprint(f"[FIT_PARALLEL] wall_start={_ts()}")
+
+        def run_actor(which: str, dataloader):
+            actor_cfg = self._actor_cfg(which)
+            _migration_cfg = actor_cfg.rollout.get("dp_migration", {})
+            _use_migration = (
+                _migration_cfg.get("enable", False)
+                and len(self._async_mgr(which).agent_loop_workers) == 2
+                and len(self._async_mgr(which).server_addresses) >= 2
+            )
+            _total_threshold = _migration_cfg.get("total_threshold", 32)
+            # A consolidates onto DP0; B consolidates onto DP1
+            _abort_dp_idx = _migration_cfg.get("abort_dp_idx", 1 if which == "a" else 0)
+            _poll_interval = _migration_cfg.get("poll_interval", 0.3)
+
+            step = 0
+            try:
+                for batch_dict in dataloader:
+                    step += 1
+                    timing_raw: dict = {}
+                    metrics:    dict = {}
+                    t_step_start = time.perf_counter()
+
+                    rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] ── step={step} BEGIN ──")
+
+                    # ── Phase 1: Rollout (concurrent with the other model) ────
+                    batch = DataProto.from_single_dict(batch_dict)
+                    batch.meta_info["temperature"] = actor_cfg.rollout.temperature
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
+                    gen_batch = self._get_gen_batch(batch)
+                    gen_batch.meta_info["global_steps"] = step
+                    gen_batch_rep = gen_batch.repeat(repeat_times=actor_cfg.rollout.n, interleave=True)
+
+                    t0 = time.perf_counter()
+                    rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} ROLLOUT start")
+
+                    if _use_migration:
+                        gen_out = self._async_mgr(which).generate_sequences_with_total_migration(
+                            gen_batch_rep,
+                            migration_threshold=_total_threshold,
+                            abort_dp_idx=_abort_dp_idx,
+                            poll_interval=_poll_interval,
+                        )
+                    else:
+                        gen_out = self._async_mgr(which).generate_sequences(gen_batch_rep)
+
+                    t_rollout = time.perf_counter() - t0
+                    timing_raw[f"rollout_{which}"] = t_rollout
+                    timing_raw.update(gen_out.meta_info.get("timing", {}))
+                    gen_out.meta_info.pop("timing", None)
+
+                    # Log migration stats
+                    _mig = gen_out.meta_info.get("dp_migration", {})
+                    if _mig.get("triggered"):
+                        t_trig = _mig.get("t_trigger_elapsed_s", 0)
+                        tail_s = _mig.get("tail_after_migration_s", 0)
+                        concurrent_s = _mig.get("t_trigger_elapsed_s", 0)
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} "
+                            f"TOTAL_MIGRATION triggered: "
+                            f"concurrent={concurrent_s:.1f}s "
+                            f"abort=DP{_mig['abort_dp_idx']}({_mig['abort_running']} running) "
+                            f"keep=DP{_mig['keep_dp_idx']}({_mig['keep_running']} running) "
+                            f"tail={tail_s:.1f}s"
+                        )
+                        timing_raw[f"migr_concurrent_{which}"] = concurrent_s
+                        timing_raw[f"migr_tail_{which}"] = tail_s or 0.0
+                    rtprint(
+                        f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} ROLLOUT done"
+                        f"  wall={t_rollout:.3f}s"
+                    )
+
+                    # ── Phase 2+3: Prep + Train + Update (serialized) ─────────
+                    t_wait_start = time.perf_counter()
+                    rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} waiting for lock …")
+                    with train_lock:
+                        t_wait = time.perf_counter() - t_wait_start
+                        timing_raw[f"gpu_lock_wait_{which}"] = t_wait
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} lock acquired"
+                            f"  (waited={t_wait:.3f}s)"
+                        )
+
+                        t0 = time.perf_counter()
+                        rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} PREP start")
+                        batch, _ = self._step_one_actor(
+                            which, batch, timing_raw, metrics,
+                            gen_batch_output_override=gen_out,
+                            _local_step=step,
+                            skip_sleep=False,
+                        )
+                        t_prep = time.perf_counter() - t0
+                        timing_raw[f"prep_{which}"] = t_prep
+                        rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} PREP done  wall={t_prep:.3f}s")
+
+                        t0 = time.perf_counter()
+                        rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} TRAIN start")
+                        actor_out = self._update_actor(which, batch)
+                        t_train = time.perf_counter() - t0
+                        timing_raw[f"update_actor_{which}"] = t_train
+                        metrics.update(reduce_metrics(actor_out.meta_info["metrics"]))
+                        rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} TRAIN done  wall={t_train:.3f}s")
+
+                        t0 = time.perf_counter()
+                        rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} UPDATE_WEIGHTS start")
+                        self._ckpt_mgr(which).update_weights()
+                        t_weights = time.perf_counter() - t0
+                        timing_raw[f"update_weights_{which}"] = t_weights
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} UPDATE_WEIGHTS done"
+                            f"  wall={t_weights:.3f}s — releasing lock"
+                        )
+
+                    t_step = time.perf_counter() - t_step_start
+                    timing_raw[f"step_{which}"] = t_step
+                    rtprint(
+                        f"[{_ts()}] [{which.upper()}-PARALLEL] step={step} SUMMARY"
+                        f"  rollout={t_rollout:.2f}s"
+                        f"  prep={t_prep:.2f}s"
+                        f"  lock_wait={t_wait:.2f}s"
+                        f"  train={t_train:.2f}s"
+                        f"  weights={t_weights:.2f}s"
+                        f"  step_wall={t_step:.2f}s"
+                        f"  fit_wall={time.perf_counter() - fit_wall_start:.2f}s"
+                    )
+
+                    metrics[f"training/{which}/step"] = step
+                    metrics[f"timing/{which}/rollout"] = t_rollout
+                    metrics[f"timing/{which}/prep"] = t_prep
+                    metrics[f"timing/{which}/lock_wait"] = t_wait
+                    metrics[f"timing/{which}/train"] = t_train
+                    metrics[f"timing/{which}/update_weights"] = t_weights
+                    metrics[f"timing/{which}/step_wall"] = t_step
+                    if f"migr_concurrent_{which}" in timing_raw:
+                        metrics[f"timing/{which}/migr_concurrent"] = timing_raw[f"migr_concurrent_{which}"]
+                        metrics[f"timing/{which}/migr_tail"]       = timing_raw[f"migr_tail_{which}"]
+                    metrics.update(
+                        rename_dict(compute_data_metrics(batch=batch, use_critic=False), f"data_{which}/")
+                    )
+
+                    with log_lock:
+                        logger.log(data=metrics, step=step)
+                        if getattr(self, "profiler", None) is not None:
+                            self.profiler.update(timing_raw=timing_raw, step=step, prefix=f"{which}_")
+
+                    if step >= total_steps:
+                        rtprint(
+                            f"[{_ts()}] [{which.upper()}-PARALLEL] reached total_steps={total_steps}, stopping."
+                        )
+                        break
+
+            except Exception as exc:
+                rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] EXCEPTION at step={step}: {exc}")
+                raise
+
+            rtprint(f"[{_ts()}] [{which.upper()}-PARALLEL] ALL DONE — completed {step} steps")
+
+        # ── Launch both threads simultaneously ───────────────────────────────
+        thread_a = threading.Thread(
+            target=run_actor, args=("a", self.train_dataloader),
+            name="actor_a", daemon=True,
+        )
+        thread_b = threading.Thread(
+            target=run_actor, args=("b", train_dl_b),
+            name="actor_b", daemon=True,
+        )
+
+        thread_a.start()
+        thread_b.start()
+
+        thread_a.join()
+        thread_b.join()
+
+        rtprint(f"[FIT_PARALLEL] wall_total={time.perf_counter() - fit_wall_start:.3f}s DONE")
 
     # =========================================================================
     # fit_overlap_b_rollout_a_train
@@ -2298,17 +2877,72 @@ class DualRayPPOTrainer:
                     mgr_a = self._async_mgr("a")
                     mgr_b = self._async_mgr("b")
 
-                    # ── Phase 1: A rollout (sync, blocking) ──
+                    # ── Phase 1: A rollout (streaming + poll, 全部完成后再进入 Phase 2) ──
+                    sampling_a = {
+                        "temperature": float(actor_cfg_a.rollout.temperature),
+                        "max_tokens": int(actor_cfg_a.rollout.response_length),
+                    }
+                    handles_a = []
+                    tokbuf_a = {}
+                    prompt_ids_a_by_handle = {}
                     t_a_roll0 = time.perf_counter()
-                    gen_out_a = mgr_a.generate_sequences(gen_a)
-                    t_a_roll1 = time.perf_counter()
-                    self._print_longest_response("fit_overlap_b_rollout_a_train_rollout_a", gen_out_a, self.global_steps)
 
-                    timing_raw.update(gen_out_a.meta_info.get("timing", {}))
-                    timing_raw["gen_a"] = t_a_roll1 - t_a_roll0  # wall: stream 开始到最后一个 token
-                    gen_out_a.meta_info.pop("timing", None)
+                    for i in range(len(gen_a)):
+                        ids = _get_prompt_ids(gen_a, i)
+                        rid = str(uuid.uuid4())
+                        ret = mgr_a.start_generate_stream(
+                            prompt_ids=ids,
+                            sampling_params=sampling_a,
+                            request_id=rid,
+                            training_global_step=self.global_steps,
+                        )
+                        h = ret["handle"]
+                        handles_a.append(h)
+                        tokbuf_a[h] = []
+                        prompt_ids_a_by_handle[h] = ids
+
+                    active_a = set(handles_a)
+                    rtprint(f"[{_ts()}] [A_STREAM] started {len(active_a)} streams")
+
+                    poll_iter_a = 0
+                    while active_a:
+                        poll_iter_a += 1
+                        poll_a = mgr_a.poll_generate_stream_many(list(active_a), timeout_ms=poll_timeout_ms)
+                        if poll_a:
+                            for item in poll_a:
+                                h = item["handle"]
+                                ev = item.get("event", item)
+                                typ = ev.get("type")
+                                if typ == "delta":
+                                    tokbuf_a[h].extend(ev.get("token_ids", []))
+                                elif typ in ("done", "error"):
+                                    active_a.discard(h)
+
+                        if poll_iter_a % 50 == 0:
+                            rtprint(
+                                f"[{_ts()}] [POLL_A] iter={poll_iter_a} active_a={len(active_a)}"
+                            )
+
+                    t_a_roll1 = time.perf_counter()
+                    for h in handles_a:
+                        mgr_a.finalize_generate_stream(h)
+                    gen_out_a = _build_output(
+                        gen_a,
+                        prompt_ids_a_by_handle,
+                        tokbuf_a,
+                        handles_a,
+                        int(actor_cfg_a.rollout.prompt_length),
+                        int(actor_cfg_a.rollout.response_length),
+                    )
                     if "uid" in batch_a.non_tensor_batch:
                         gen_out_a.non_tensor_batch["uid"] = batch_a.non_tensor_batch["uid"]
+
+                    rollout_a_wall = t_a_roll1 - t_a_roll0
+                    timing_raw["puzzrl_rollout_a"] = rollout_a_wall
+                    rtprint(
+                        f"[{_ts()}] [ROLLOUT_TIMING] A rollout done: {_fmt(rollout_a_wall)}",
+                    )
+                    self._print_longest_response("fit_overlap_b_rollout_a_train_rollout_a", gen_out_a, self.global_steps)
 
                     # ── Phase 2: start B rollout (streaming) ──
                     sampling_b = {
@@ -2319,6 +2953,7 @@ class DualRayPPOTrainer:
                     active_b = set()
                     tokbuf_b = {}
                     prompt_ids_b_by_handle = {}
+                    t_b_roll0 = time.perf_counter()
 
                     for i in range(len(gen_b)):
                         ids = _get_prompt_ids(gen_b, i)
@@ -2343,8 +2978,6 @@ class DualRayPPOTrainer:
                     # ── Phase 3: poll B; when active_b <= threshold, start A train in a thread ──
                     overlap_time = 0.0
                     b_extra_after_train = 0.0
-                    t_overlap0 = time.perf_counter()
-
                     started_a_train = False
                     a_train_done = False
 
@@ -2406,8 +3039,6 @@ class DualRayPPOTrainer:
                                 t_a_train_start = time.perf_counter()
                                 fut_a = ex.submit(_run_a_train)
 
-                            # Exit polling as soon as all B streams finish.
-                            # A 训练线程在循环外用 fut_a.result() 等待即可。
                             if not active_b:
                                 rtprint(
                                     f"[{_ts()}] [POLL_B] exit loop "
@@ -2428,13 +3059,11 @@ class DualRayPPOTrainer:
                         else:
                             t_a_train_start = t_a_train_end = None
 
-                    t_overlap1 = time.perf_counter()
+                    t_b_roll1 = time.perf_counter()
 
-                    # Finalize B streams
                     for h in handles_b:
                         mgr_b.finalize_generate_stream(h)
 
-                    # Build B rollout outputs from streamed tokens
                     gen_out_b = _build_output(
                         gen_b,
                         prompt_ids_b_by_handle,
@@ -2443,21 +3072,24 @@ class DualRayPPOTrainer:
                         int(actor_cfg_b.rollout.prompt_length),
                         int(actor_cfg_b.rollout.response_length),
                     )
+                    rollout_b_wall = t_b_roll1 - t_b_roll0
+                    timing_raw["puzzrl_rollout_b"] = rollout_b_wall
+
+                    rtprint(
+                        f"[{_ts()}] [ROLLOUT_TIMING] B rollout done: {_fmt(rollout_b_wall)}",
+                    )
                     self._print_longest_response("fit_overlap_b_rollout_a_train_rollout_b", gen_out_b, self.global_steps)
 
-                    # Overlap statistics (approximate)
                     if t_a_train_start is not None and t_a_train_end is not None:
                         a_train_wall = t_a_train_end - t_a_train_start
                     else:
                         a_train_wall = 0.0
-                    b_roll_wall = t_overlap1 - t_overlap0
-                    timing_raw["gen_b"] = b_roll_wall
-                    overlap_time = min(a_train_wall, b_roll_wall) if a_train_wall > 0 else 0.0
-                    b_extra_after_train = max(0.0, b_roll_wall - a_train_wall)
+                    overlap_time = min(a_train_wall, rollout_b_wall) if a_train_wall > 0 else 0.0
+                    b_extra_after_train = max(0.0, rollout_b_wall - a_train_wall)
 
                     rtprint(
                         f"[{_ts()}] [OVERLAP] a_train={_fmt(a_train_wall)} "
-                        f"b_roll={_fmt(b_roll_wall)} overlap={_fmt(overlap_time)} "
+                        f"b_roll={_fmt(rollout_b_wall)} overlap={_fmt(overlap_time)} "
                         f"b_extra={_fmt(b_extra_after_train)}",
                     )
 

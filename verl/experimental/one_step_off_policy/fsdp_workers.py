@@ -74,7 +74,13 @@ class DetachSync(AsyncActorRolloutRefWorker):
         params = self._get_actor_params() if self._is_actor else None
 
         rollout_name = self.config.rollout.name
-        if self._is_rollout:
+        # ServerAdapter (async mode): client that pushes weights via ZMQ; no inference_engine.
+        # Hybrid/colocated: rollout has inference_engine directly.
+        use_server_adapter = self._is_rollout and rollout_name == "vllm" and not hasattr(
+            self.rollout, "inference_engine"
+        )
+        inference_model = None
+        if self._is_rollout and not use_server_adapter:
             if rollout_name == "vllm":
                 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
@@ -85,6 +91,7 @@ class DetachSync(AsyncActorRolloutRefWorker):
             else:
                 raise NotImplementedError(f"Unknown rollout name: {rollout_name}")
         loop = get_event_loop()
+        vllm_server_adapter_collected = []  # for ServerAdapter: collect (key, tensor) then batch update
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
@@ -101,7 +108,9 @@ class DetachSync(AsyncActorRolloutRefWorker):
                 collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
 
             if self._is_rollout:
-                if rollout_name == "vllm":
+                if use_server_adapter:
+                    vllm_server_adapter_collected.append((key, tensor))
+                elif rollout_name == "vllm":
                     inference_model.load_weights([(key, tensor)])
                 elif rollout_name == "sglang":
                     # first_rank_in_node = self._tp_rank % tp_size_per_node == 0，
@@ -110,6 +119,59 @@ class DetachSync(AsyncActorRolloutRefWorker):
 
                     if inference_model is not None:
                         loop.run_until_complete(self.update_weights(inference_model, [(key, tensor)]))
+
+        if use_server_adapter and vllm_server_adapter_collected:
+            async def _weight_iter():
+                for k, t in vllm_server_adapter_collected:
+                    yield k, t
+
+            loop.run_until_complete(self.rollout.update_weights(_weight_iter()))
+
+        if self._is_actor and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        get_torch_device().empty_cache()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def sync_weights_with_group(self, group_name: str, src_rank: int):
+        """Parameterized weight sync for dual trainer cross-pool broadcasting.
+
+        Mirrors sync_rollout_weights but uses explicit group_name and src_rank
+        so that pool_a and pool_b can form one shared NCCL group and sync two
+        models with different broadcast directions without creating extra groups.
+        Does NOT break the existing 'actor_rollout' group used by single-model trainers.
+        """
+        assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
+        assert hasattr(self, "_weights_info") and self._weights_info is not None
+
+        if self._is_actor and self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        params = self._get_actor_params() if self._is_actor else None
+
+        rollout_name = self.config.rollout.name
+        inference_model = None
+        if self._is_rollout:
+            if rollout_name == "sglang":
+                inference_model = self.rollout._engine
+            elif rollout_name == "vllm" and hasattr(self.rollout, "inference_engine"):
+                from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+                inference_model = self.rollout.inference_engine.worker.model_runner.model
+                patch_vllm_moe_model_weight_loader(inference_model)
+
+        loop = get_event_loop()
+        for key, shape, dtype in self._weights_info:
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if self._is_actor:
+                assert key in params
+                origin_data = params[key]
+                if hasattr(origin_data, "full_tensor"):
+                    origin_data = origin_data.full_tensor()
+                if torch.distributed.get_rank() == 0:
+                    tensor.copy_(origin_data)
+
+            collective.broadcast(tensor, src_rank=src_rank, group_name=group_name)
+
+            if self._is_rollout and inference_model is not None:
+                loop.run_until_complete(self.update_weights(inference_model, [(key, tensor)]))
 
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

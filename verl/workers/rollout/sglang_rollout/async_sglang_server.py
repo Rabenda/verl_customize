@@ -932,6 +932,12 @@ class SGLangReplica(RolloutReplica):
             model_role = getattr(self.config, "model_role", None) or ""
             print(f"SGLang Replica model_role: {model_role}")
             env_vars["SGLANG_MODEL_ROLE"] = str(model_role)
+            # For multi-model (role != "a"/"b"), disable green context SM partition
+            # creation entirely. The hardware-level SM partition created by
+            # split_device_green_ctx_by_sm_count conflicts across concurrent
+            # processes even when the algo is "disable" and streams are unused.
+            if model_role not in ("a", "b"):
+                env_vars["SGLANG_GREENCTX_SM"] = ""
             mps_pct = getattr(self.config, "mps_active_thread_percentage", 0)
             print(f"SGLang Replica mps_pct: {mps_pct}")
             if mps_pct > 0:

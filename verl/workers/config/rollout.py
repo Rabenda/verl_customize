@@ -214,6 +214,10 @@ class RolloutConfig(BaseConfig):
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
+    # Inter-DP migration config (DP=2 only).  Read by fit_async_pipeline.
+    # enable: bool, threshold: int, poll_interval: float
+    dp_migration: dict = field(default_factory=dict)
+
     skip_rollout: bool = False
 
     skip_dump_dir: str = "/tmp/rollout_dump"

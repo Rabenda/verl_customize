@@ -142,6 +142,12 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         if not is_cancel:
             output = self._postprocess(outputs)
             output = self._addition_process(output)
+            # Restore metadata fields from the original batch that _postprocess discards
+            # (e.g. reward_model, data_source, extra_info needed by the reward function)
+            _meta_keys = {"reward_model", "data_source", "extra_info"}
+            for key in _meta_keys:
+                if key in batch.non_tensor_batch and key not in output.non_tensor_batch:
+                    output.non_tensor_batch[key] = batch.non_tensor_batch[key]
             return output, is_cancel
         return outputs, is_cancel
 
@@ -239,6 +245,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         self.server_handles = None
         self.server_addresses = None
         self.agent_loop_workers = None
+        self.reward_loop_worker_handles = None
 
     @classmethod
     async def create(

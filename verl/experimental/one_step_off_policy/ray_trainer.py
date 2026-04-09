@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import asyncio
+import time
 import uuid
 from pprint import pprint
 
@@ -125,6 +126,15 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _generate_rollout_batch(self, gen_batch, *, curr_step_profile: bool = False):
+        # Rollout runs on a dedicated standalone GPU pool — no checkpoint_manager needed.
+        if curr_step_profile:
+            self.async_rollout_manager.start_profile(global_step=self.global_steps)
+        output = self.async_rollout_manager.generate_sequences(gen_batch)
+        if curr_step_profile:
+            self.async_rollout_manager.stop_profile()
+        return output
 
     def _validate(self):
         self.actor_rollout_wg = self.rollout_wg
@@ -291,13 +301,13 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         self.async_rollout_mode = True
 
-        if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
-            rm_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-        else:
-            rm_resource_pool = None
+        rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
 
         self.async_rollout_manager = OneStepOffAgentLoopManager(
-            config=self.config, worker_group=self.rollout_wg, rm_resource_pool=rm_resource_pool
+            config=self.config,
+            worker_group=self.rollout_wg,
+            rollout_resource_pool=rollout_resource_pool,
+            reward_loop_worker_handles=None,
         )
 
     def sync_rollout_weights(self):
@@ -409,6 +419,31 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         return combined_reward_tensor, combined_extras_dict
 
+    def _print_unified_timing(self, step: int, timing_raw: dict):
+        """Print a unified per-step timing summary similar to ray_dual_trainer."""
+        def _s(v):
+            return f"{v:.3f}s" if v is not None else "n/a"
+
+        gen          = timing_raw.get("gen")
+        sync         = timing_raw.get("sync_rollout_weights")
+        old_log_prob = timing_raw.get("old_log_prob")
+        ref_log_prob = timing_raw.get(str(Role.RefPolicy))
+        adv          = timing_raw.get("adv")
+        update_actor = timing_raw.get("update_actor")
+        total        = timing_raw.get("step")
+
+        print(
+            f"[TIMING] step={step}"
+            f"  gen={_s(gen)}"
+            f"  sync_weights={_s(sync)}"
+            f"  old_log_prob={_s(old_log_prob)}"
+            f"  ref_log_prob={_s(ref_log_prob)}"
+            f"  adv={_s(adv)}"
+            f"  update_actor={_s(update_actor)}"
+            f"  step_total={_s(total)}",
+            flush=True,
+        )
+
     async def fit(self):
         """
         The training loop of PPO.
@@ -421,12 +456,17 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
         from verl.utils.tracking import Tracking
 
+        _ts = lambda: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+
+        fit_wall_start = time.perf_counter()
+        print(f"[FIT] wall_start={_ts()}", flush=True)
 
         self.global_steps = 0
 
@@ -488,6 +528,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
+            print(f"[{_ts()}] [FIT] step={self.global_steps} begin", flush=True)
 
             with marked_timer("start_profile", timing_raw):
                 self._start_profiling(
@@ -697,7 +738,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
             # 3. The current step number is a multiple of the save frequency.
             # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
             if self.config.trainer.save_freq > 0 and (
-                is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
             ):
                 if esi_close_to_expiration:
                     print("Force saving checkpoint: ESI instance expiration approaching.")
@@ -720,6 +761,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
 
             steps_duration = timing_raw["step"]
             self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+            self._print_unified_timing(self.global_steps, timing_raw)
 
             # training metrics
             metrics.update(
@@ -759,6 +801,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
+                print(f"[FIT] wall_total={time.perf_counter() - fit_wall_start:.3f}s (completed)", flush=True)
                 return
 
             # this is experimental and may be changed/removed in the future

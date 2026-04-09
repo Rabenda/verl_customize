@@ -29,6 +29,7 @@ from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.ray_dual_trainer import DualRayPPOTrainer
 from verl.trainer.ppo.ray_dual_one_step_off_trainer import DualRayOneStepOffPPOTrainer
+from verl.trainer.ppo.ray_multi_trainer import MultiRayPPOTrainer, _MULTI_ROLES
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
@@ -409,6 +410,8 @@ class TaskRunner:
     # Main run
     # ---------------------------
     def run(self, config):
+        if getattr(config.trainer, "multi_model", False):
+            return self.run_multi_model(config)
         if getattr(config.trainer, "dual_model", False):
             return self.run_dual_model(config)
 
@@ -679,8 +682,161 @@ class TaskRunner:
         elif fit_method == "naive":
             print(f"[FIT] no overlap", flush=True)
             trainer.fit()
+        elif fit_method == "async_pipeline":
+            print(f"[FIT] using fit_async_pipeline (fully async A/B pipeline with train_lock)", flush=True)
+            trainer.fit_async_pipeline()
+        elif fit_method == "parallel_pipeline":
+            print(f"[FIT] using fit_parallel_pipeline (simultaneous A+B rollout, total-based migration)", flush=True)
+            trainer.fit_parallel_pipeline()
         else:
             raise ValueError(f"Invalid fit_method: {fit_method}")
+
+    # ---------------------------
+    # Multi-model workers (N-way colocated)
+    # ---------------------------
+    def add_actor_rollout_workers_multi(self, config):
+        """Register N colocated ActorRolloutRefWorkers for multi-model training."""
+        from verl.trainer.ppo.utils import Role
+        from verl.single_controller.ray import RayWorkerGroup
+        from verl.workers.engine_workers import ActorRolloutRefWorker
+
+        assert config.trainer.get("use_legacy_worker_impl", "auto") == "disable"
+
+        N = int(config.trainer.num_models)
+        assert 2 <= N <= len(_MULTI_ROLES), f"num_models must be 2..{len(_MULTI_ROLES)}, got {N}"
+
+        for i in range(N):
+            lora = OmegaConf.select(config, f"actor_rollout_ref_{i}.model.lora.rank") or 0
+            assert int(lora) <= 0, f"Multi-model mode does not support lora (model {i})"
+
+        for i in range(N):
+            role = _MULTI_ROLES[i]
+            self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+            self.mapping[role] = "global_pool"
+
+        return ActorRolloutRefWorker, RayWorkerGroup
+
+    # ---------------------------
+    # run_multi_model
+    # ---------------------------
+    def run_multi_model(self, config):
+        """
+        N-model co-located PPO training with parallel rollout + serial train.
+          config.trainer.num_models = N
+          config.trainer.fit_method = "multi_overlap_decode"
+          config.actor_rollout_ref_0 .. config.actor_rollout_ref_{N-1}
+        """
+        import socket
+        from copy import deepcopy
+        from omegaconf import OmegaConf, open_dict
+        from verl.utils.fs import copy_to_local
+        from verl.utils import hf_processor, hf_tokenizer
+        from verl.trainer.ppo.reward import load_reward_manager
+
+        OmegaConf.resolve(config)
+
+        N = int(config.trainer.num_models)
+        assert N >= 2, "multi_model mode requires num_models >= 2"
+
+        assert hasattr(config, "actor_rollout_ref"), "config.actor_rollout_ref must exist as base schema"
+
+        # ---- deep-merge helper (same as run_dual_model) ----
+        def _to_dict(cfg):
+            return OmegaConf.to_container(cfg, resolve=False) if cfg is not None else None
+
+        def _deep_merge(base, override):
+            if override is None:
+                return base
+            if base is None:
+                return override
+            if isinstance(base, dict) and isinstance(override, dict):
+                out = dict(base)
+                for k, v in override.items():
+                    out[k] = _deep_merge(out.get(k), v)
+                return out
+            if isinstance(override, list):
+                return override
+            return override
+
+        base_shared_dict = _to_dict(deepcopy(config.actor_rollout_ref))
+
+        def _build_full_actor_cfg(i: int):
+            node = getattr(config, f"actor_rollout_ref_{i}", None)
+            node_dict = _to_dict(node)
+            merged_dict = _deep_merge(deepcopy(base_shared_dict), node_dict)
+
+            model = merged_dict.get("model", {})
+            model.pop("path_a", None)
+            model.pop("path_b", None)
+            merged_dict["model"] = model
+
+            rollout = merged_dict.get("rollout", {})
+            rollout.pop("n_a", None)
+            rollout.pop("n_b", None)
+            rollout["model_role"] = str(i)
+            merged_dict["rollout"] = rollout
+
+            actor = merged_dict.get("actor", {})
+            base_actor = base_shared_dict.get("actor", {}) if isinstance(base_shared_dict, dict) else {}
+            if isinstance(base_actor, dict):
+                for k, v in base_actor.items():
+                    if k not in actor:
+                        actor[k] = v
+            merged_dict["actor"] = actor
+
+            return OmegaConf.create(merged_dict)
+
+        # Build and write back per-model configs
+        cfgs = [_build_full_actor_cfg(i) for i in range(N)]
+        with open_dict(config):
+            for i in range(N):
+                setattr(config, f"actor_rollout_ref_{i}", cfgs[i])
+            # Keep config.actor_rollout_ref pointing to model 0 for compatibility
+            config.actor_rollout_ref = deepcopy(cfgs[0])
+
+        # Register workers
+        self.add_actor_rollout_workers_multi(config)
+        self.add_reward_model_worker(config)
+
+        # Load tokenizer from model 0
+        local_path = copy_to_local(
+            cfgs[0].model.path,
+            use_shm=cfgs[0].model.get("use_shm", False),
+        )
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+
+        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
+        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
+
+        resource_pool_manager = self.init_resource_pool_mgr(config)
+
+        # Let the trainer's _create_dataloader build dataset/sampler internally
+        trainer = MultiRayPPOTrainer(
+            config=config,
+            tokenizer=tokenizer,
+            processor=processor,
+            role_worker_mapping=self.role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            reward_fn=reward_fn,
+            val_reward_fn=val_reward_fn,
+        )
+
+        trainer.init_workers()
+        print(f"[FIT] init_workers DONE, num_models={N}", flush=True)
+
+        fit_method = OmegaConf.select(config.trainer, "fit_method", default="multi_overlap_decode")
+        if fit_method == "multi_overlap_decode":
+            poll_timeout_ms = int(OmegaConf.select(config.trainer, "overlap_poll_timeout_ms", default=20))
+            print(f"[FIT] using fit_multi_overlap_decode (poll_timeout_ms={poll_timeout_ms})", flush=True)
+            trainer.fit_multi_overlap_decode(poll_timeout_ms=poll_timeout_ms)
+        elif fit_method == "multi_pipeline":
+            max_cr = int(OmegaConf.select(config.trainer, "max_concurrent_rollout", default=3))
+            print(f"[FIT] using fit_multi_pipeline (max_concurrent_rollout={max_cr})", flush=True)
+            trainer.fit_multi_pipeline(max_concurrent_rollout=max_cr)
+        else:
+            raise ValueError(f"Unsupported fit_method for multi_model: {fit_method!r}. Use 'multi_overlap_decode' or 'multi_pipeline'.")
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
     from verl.utils.dataset.rl_dataset import get_dataset_class

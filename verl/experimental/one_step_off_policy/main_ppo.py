@@ -133,17 +133,11 @@ def create_role_worker_mapping(config):
 @ray.remote(num_cpus=10, max_concurrency=100)  # please make sure main_task is not scheduled on head
 class OneStepTaskRunner:
     def run(self, config):
-        # Print the initial configuration. `resolve=True` will evaluate symbolic values.
-        from pprint import pprint
-
         from omegaconf import OmegaConf
 
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-
-        pprint(OmegaConf.to_container(config, resolve=True))
-
         OmegaConf.resolve(config)
 
         role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config)

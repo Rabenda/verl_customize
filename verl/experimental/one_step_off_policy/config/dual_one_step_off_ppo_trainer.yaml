@@ -1,0 +1,30 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# pool_b size: rollout.n_gpus_per_node MUST equal trainer.n_gpus_per_node
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 2
+
+# Both actor_rollout_ref_a and actor_rollout_ref_b must be set via CLI.
+# Required rollout settings for one-step-off async mode:
+actor_rollout_ref_a:
+  rollout:
+    mode: async
+    free_cache_engine: False
+    calculate_log_probs: True
+
+actor_rollout_ref_b:
+  rollout:
+    mode: async
+    free_cache_engine: False
+    calculate_log_probs: True
+
+algorithm:
+  rollout_correction:
+    bypass_mode: True

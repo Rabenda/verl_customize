@@ -26,23 +26,43 @@ logger = logging.getLogger(__name__)
 @ray.remote
 class ParameterSynchronizer:
     """
-    Unified parameter synchronizer, responsible for synchronizing model parameters between actor and rollout
-    Based on the mature synchronization mode implementation of one_step_off_policy
-    Merges the functions of the original multiple synchronizer classes
+    Unified parameter synchronizer, responsible for synchronizing model parameters between actor and rollout.
+
+    Can be constructed in two ways:
+    1. Legacy (single-model): pass trainer + rollouter; actor_wg / rollout_wg are derived automatically.
+    2. Dual-model: pass actor_wg + rollout_wg + rollouter directly, along with sync_group_name.
     """
 
-    def __init__(self, config, trainer, rollouter, mq):
+    def __init__(
+        self,
+        config,
+        rollouter,
+        mq,
+        trainer=None,
+        actor_wg=None,
+        rollout_wg=None,
+        sync_group_name: str = "actor_rollout",
+    ):
         self.config = config
-        self.trainer = trainer
         self.rollouter = rollouter
         self.mq_client = mq
-        self.actor_wg = ray.get(trainer.get_actor_wg.remote())
-        self.rollout_wg = ray.get(rollouter.get_rollout_wg.remote())
+        self.sync_group_name = sync_group_name
+
+        # Resolve worker groups
+        if actor_wg is not None:
+            self.actor_wg = actor_wg
+        else:
+            assert trainer is not None, "Must pass either actor_wg or trainer"
+            self.actor_wg = ray.get(trainer.get_actor_wg.remote())
+
+        if rollout_wg is not None:
+            self.rollout_wg = rollout_wg
+        else:
+            self.rollout_wg = ray.get(rollouter.get_rollout_wg.remote())
 
         # Basic attributes
         self.weights_info = None
         self.sync_group_initialized = False
-        self.sync_group_name = "actor_rollout"
         self.wait_last_update = None
         self.wait_last_resume = None
         self.validate_task = None

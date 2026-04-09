@@ -522,6 +522,8 @@ class AgentLoopWorker:
             top_k=config.top_k,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            # 显式传入 max_tokens，与 B rollout 的 start_generate_stream 一致，避免 A 的 rollout 被 max_model_len 等截断
+            max_tokens=int(config.response_length),
         )
 
         # override sampling params for validation
@@ -656,10 +658,15 @@ class AgentLoopWorker:
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
         self.tokenizer.padding_side = "right"
+        _response_length = self.config.actor_rollout_ref.rollout.response_length
+        _pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        # Guard against empty response_ids (e.g. request aborted before any token was generated)
+        _response_ids = list(output.response_ids) if output.response_ids else [_pad_id]
+        _response_mask = list(output.response_mask) if output.response_mask else [0]
         response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
+            {"input_ids": _response_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=_response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -668,9 +675,9 @@ class AgentLoopWorker:
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
+            {"input_ids": _response_mask},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=_response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -1227,6 +1234,335 @@ class AgentLoopManager:
 
     def cancel_generate_stream(self, handle, replica: int = 0):
         return ray.get(self.server_handles[replica].cancel_generate_stream.remote(handle))
+
+    # =========================================================================
+    # Inter-DP Migration (DP=2 only, single-turn)
+    # =========================================================================
+    def generate_sequences_with_migration(
+        self,
+        prompts: DataProto,
+        migration_threshold: int = 32,
+        abort_dp_idx: int = -1,
+        poll_interval: float = 0.3,
+    ) -> DataProto:
+        """
+        DP=2 inter-DP workload migration.
+
+        Splits the batch 50/50 across DP0 and DP1 as usual.  A background
+        thread continuously polls /v1/loads on both SGLang servers.  Once
+        EITHER server reports num_running_reqs <= migration_threshold (after
+        both have peaked above 2*threshold), we abort the lighter DP and let
+        the heavier one finish alone.  In SGLang streaming mode, an aborted
+        request returns whatever tokens it has generated so far
+        (finish_reason=abort), so the aborted worker's Ray task completes
+        quickly with partial outputs for the aborted sequences.
+
+        Result: the lighter DP is freed earlier, releasing GPU memory for
+        co-located training (e.g. multiplexing with model B).  The aborted
+        sequences have shorter responses and are returned as-is for GRPO.
+
+        Args:
+            prompts: input DataProto, same format as generate_sequences().
+            migration_threshold: trigger migration when either DP drops to
+                this many (or fewer) running requests (after peaking).
+            poll_interval: seconds between /v1/loads polls.
+
+        Returns:
+            DataProto with all sequences.  meta_info["dp_migration"] carries
+            a dict with migration stats (triggered, source_idx, etc.).
+        """
+        import threading
+        import requests as _req
+        import time as _time
+
+        assert len(self.agent_loop_workers) == 2, (
+            "generate_sequences_with_migration only supports DP=2 "
+            f"(got {len(self.agent_loop_workers)} workers)"
+        )
+        assert len(self.server_addresses) >= 2, "need at least 2 server_addresses"
+
+        import datetime as _dt
+
+        chunks = prompts.chunk(2)
+
+        t_start = _time.perf_counter()
+        t_start_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+        # Submit both workers non-blocking
+        fut0 = self.agent_loop_workers[0].generate_sequences.remote(chunks[0])
+        fut1 = self.agent_loop_workers[1].generate_sequences.remote(chunks[1])
+
+        urls = [f"http://{self.server_addresses[i]}" for i in range(2)]
+        print(
+            f"[DP_MIGRATION] START {t_start_wall} "
+            f"server_addresses={self.server_addresses} threshold={migration_threshold}",
+            flush=True,
+        )
+
+        # Shared state between monitor thread and main thread
+        stop_event = threading.Event()
+        migration_info: dict = {"triggered": False}
+
+        def _query_running(url: str) -> int:
+            """Return num_running_reqs for the SGLang server at url, or 999 on error."""
+            try:
+                resp = _req.get(f"{url}/v1/loads", timeout=2)
+                data = resp.json()
+                # /v1/loads returns {"loads": [...], "aggregate": {...}, ...}
+                if isinstance(data, dict) and "loads" in data:
+                    loads = data["loads"]
+                    if loads:
+                        return int(loads[0].get("num_running_reqs", 999))
+                    return int(data.get("aggregate", {}).get("total_running_reqs", 0))
+                # Legacy: flat list format
+                if isinstance(data, list) and data:
+                    return int(data[0].get("num_running_reqs", 999))
+            except Exception as e:
+                print(f"[DP_MIGRATION] _query_running({url}) error: {e}", flush=True)
+            return 999
+
+        def _monitor():
+            """Poll both DPs; abort the lighter one when either hits threshold."""
+            # Arm migration only after either DP has genuinely peaked above
+            # 2*threshold, preventing false triggers on trivially small batches.
+            seen_peak = False
+            peak_threshold = 2 * migration_threshold
+            while not stop_event.is_set():
+                r0 = _query_running(urls[0])
+                r1 = _query_running(urls[1])
+                elapsed = _time.perf_counter() - t_start
+                t_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                print(
+                    f"[DP_MIGRATION] {t_wall} +{elapsed:.1f}s "
+                    f"poll: DP0={r0} DP1={r1} threshold={migration_threshold} seen_peak={seen_peak}",
+                    flush=True,
+                )
+
+                if not seen_peak:
+                    if max(r0, r1) >= peak_threshold:
+                        seen_peak = True
+                        print(
+                            f"[DP_MIGRATION] {t_wall} +{elapsed:.1f}s "
+                            f"peak reached (DP0={r0} DP1={r1}, max >= {peak_threshold}), migration armed",
+                            flush=True,
+                        )
+                    else:
+                        _time.sleep(poll_interval)
+                        continue
+
+                if min(r0, r1) <= migration_threshold:
+                    # Abort fixed DP if abort_dp_idx specified, else lighter DP
+                    if abort_dp_idx >= 0:
+                        source_idx = abort_dp_idx
+                    else:
+                        source_idx = 0 if r0 <= r1 else 1
+                    target_idx = 1 - source_idx
+                    source_running = r0 if source_idx == 0 else r1
+                    target_running = r1 if source_idx == 0 else r0
+
+                    t_trigger = _time.perf_counter() - t_start
+                    t_trigger_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+                    source_url = urls[source_idx]
+                    try:
+                        _req.post(
+                            f"{source_url}/abort_request",
+                            json={"abort_all": True},
+                            timeout=5,
+                        )
+                        migration_info.update({
+                            "triggered": True,
+                            "source_idx": source_idx,
+                            "target_idx": target_idx,
+                            "source_running_at_abort": source_running,
+                            "target_running_at_abort": target_running,
+                            "t_trigger_wall": t_trigger_wall,
+                            "t_trigger_elapsed_s": round(t_trigger, 3),
+                        })
+                        print(
+                            f"[DP_MIGRATION] TRIGGERED {t_trigger_wall} +{t_trigger:.1f}s "
+                            f"aborted DP{source_idx}(running={source_running}) → "
+                            f"keep DP{target_idx}(running={target_running})",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(f"[DP_MIGRATION] abort request failed: {exc}", flush=True)
+
+                    break
+
+                _time.sleep(poll_interval)
+
+        monitor_thread = threading.Thread(target=_monitor, daemon=True, name="dp_migration_monitor")
+        monitor_thread.start()
+
+        # Wait for both workers to finish (source returns early after abort)
+        results = ray.get([fut0, fut1])
+
+        t_done = _time.perf_counter() - t_start
+        t_done_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        stop_event.set()
+        monitor_thread.join(timeout=5)
+
+        # Tail duration = time from migration trigger to all futures completing
+        t_trigger_elapsed = migration_info.get("t_trigger_elapsed_s")
+        tail_s = round(t_done - t_trigger_elapsed, 3) if t_trigger_elapsed is not None else None
+        migration_info["t_done_wall"] = t_done_wall
+        migration_info["t_total_elapsed_s"] = round(t_done, 3)
+        migration_info["tail_after_migration_s"] = tail_s
+
+        print(
+            f"[DP_MIGRATION] DONE {t_done_wall} +{t_done:.1f}s total"
+            + (f" | tail after migration = {tail_s:.1f}s" if tail_s is not None
+               else " | no migration triggered"),
+            flush=True,
+        )
+
+        output = DataProto.concat(results)
+        output.meta_info["dp_migration"] = migration_info
+        return output
+
+    def generate_sequences_with_total_migration(
+        self,
+        prompts: DataProto,
+        migration_threshold: int = 32,
+        abort_dp_idx: int = 1,
+        poll_interval: float = 0.3,
+    ) -> DataProto:
+        """
+        Total-load-based DP migration for parallel rollout.
+
+        Triggers when DP0 + DP1 combined running requests drops below
+        migration_threshold.  Always aborts the DP specified by abort_dp_idx
+        (model A uses abort_dp_idx=1 to consolidate onto DP0/GPU-pair-0;
+        model B uses abort_dp_idx=0 to consolidate onto DP1/GPU-pair-1).
+
+        After both models have migrated, A and B occupy disjoint GPU pairs
+        with zero MPS competition on the tail.
+
+        Args:
+            prompts: input DataProto.
+            migration_threshold: abort when DP0_running + DP1_running < this.
+            abort_dp_idx: which DP to abort (0 or 1); the other DP keeps all
+                remaining requests.
+            poll_interval: seconds between /v1/loads polls.
+
+        Returns:
+            DataProto with all sequences.  meta_info["dp_migration"] carries
+            timing stats (triggered, abort_dp_idx, t_trigger_elapsed_s, …).
+        """
+        import threading
+        import requests as _req
+        import time as _time
+        import datetime as _dt
+
+        assert len(self.agent_loop_workers) == 2, (
+            "generate_sequences_with_total_migration requires DP=2"
+        )
+        assert len(self.server_addresses) >= 2, "need at least 2 server_addresses"
+
+        keep_dp_idx = 1 - abort_dp_idx
+        chunks = prompts.chunk(2)
+
+        t_start = _time.perf_counter()
+        t_start_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+        fut0 = self.agent_loop_workers[0].generate_sequences.remote(chunks[0])
+        fut1 = self.agent_loop_workers[1].generate_sequences.remote(chunks[1])
+
+        urls = [f"http://{self.server_addresses[i]}" for i in range(2)]
+
+        print(
+            f"[DP_TOTAL_MIGR] START {t_start_wall} "
+            f"threshold(total)={migration_threshold} "
+            f"abort_dp={abort_dp_idx} keep_dp={keep_dp_idx}",
+            flush=True,
+        )
+
+        stop_event = threading.Event()
+        migration_info: dict = {"triggered": False}
+
+        def _query_running(url: str) -> int:
+            try:
+                resp = _req.get(f"{url}/v1/loads", timeout=2)
+                return int(resp.json().get("num_running_reqs", 0))
+            except Exception:
+                return 999
+
+        def _monitor():
+            while not stop_event.is_set():
+                r0 = _query_running(urls[0])
+                r1 = _query_running(urls[1])
+                total = r0 + r1
+                elapsed = _time.perf_counter() - t_start
+                t_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                print(
+                    f"[DP_TOTAL_MIGR] {t_wall} +{elapsed:.1f}s "
+                    f"poll: DP0={r0} DP1={r1} total={total} threshold={migration_threshold}",
+                    flush=True,
+                )
+
+                if total > 0 and total < migration_threshold:
+                    abort_running = r0 if abort_dp_idx == 0 else r1
+                    keep_running  = r1 if abort_dp_idx == 0 else r0
+                    t_trigger = _time.perf_counter() - t_start
+                    t_trigger_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    try:
+                        _req.post(
+                            f"{urls[abort_dp_idx]}/abort_request",
+                            json={"abort_all": True},
+                            timeout=5,
+                        )
+                        migration_info.update({
+                            "triggered": True,
+                            "abort_dp_idx": abort_dp_idx,
+                            "keep_dp_idx": keep_dp_idx,
+                            "abort_running": abort_running,
+                            "keep_running": keep_running,
+                            "total_at_trigger": total,
+                            "t_trigger_wall": t_trigger_wall,
+                            "t_trigger_elapsed_s": round(t_trigger, 3),
+                        })
+                        print(
+                            f"[DP_TOTAL_MIGR] TRIGGERED {t_trigger_wall} +{t_trigger:.1f}s "
+                            f"total={total}<{migration_threshold}  "
+                            f"aborted DP{abort_dp_idx}(running={abort_running}) → "
+                            f"keep DP{keep_dp_idx}(running={keep_running})",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(f"[DP_TOTAL_MIGR] abort request failed: {exc}", flush=True)
+                    break
+
+                _time.sleep(poll_interval)
+
+        monitor_thread = threading.Thread(
+            target=_monitor, daemon=True, name="dp_total_migr_monitor"
+        )
+        monitor_thread.start()
+
+        results = ray.get([fut0, fut1])
+
+        t_done = _time.perf_counter() - t_start
+        t_done_wall = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        stop_event.set()
+        monitor_thread.join(timeout=5)
+
+        t_trigger_elapsed = migration_info.get("t_trigger_elapsed_s")
+        tail_s = round(t_done - t_trigger_elapsed, 3) if t_trigger_elapsed is not None else None
+        migration_info["t_done_wall"] = t_done_wall
+        migration_info["t_total_elapsed_s"] = round(t_done, 3)
+        migration_info["tail_after_migration_s"] = tail_s
+
+        print(
+            f"[DP_TOTAL_MIGR] DONE {t_done_wall} +{t_done:.1f}s total"
+            + (f" | tail after migration = {tail_s:.1f}s" if tail_s is not None
+               else " | no migration triggered"),
+            flush=True,
+        )
+
+        output = DataProto.concat(results)
+        output.meta_info["dp_migration"] = migration_info
+        return output
 
     # =========================================================================
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

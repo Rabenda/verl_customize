@@ -448,12 +448,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # self._is_ref = self.role in ["ref", "actor_rollout_ref"]
         # We are using two actor models now
         # print("self.role", self.role)
+        _multi_roles = [f"actor_rollout_m{i}" for i in range(8)]
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref", \
-                     "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"]
+                     "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"] + _multi_roles
         self._is_actor   = self.role in ["actor", "actor_rollout", "actor_rollout_ref", \
-                                        "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"]
+                                        "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"] + _multi_roles
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref", \
-                                        "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"]
+                                        "actor_rollout_ref_a", "actor_rollout_ref_b", "actor_rollout_a", "actor_rollout_b"] + _multi_roles
         self._is_ref     = self.role in ["ref", "actor_rollout_ref", \
                                         "actor_rollout_ref_a", "actor_rollout_ref_b"]
 
@@ -711,18 +712,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.checkpoint_engine.send_weights(per_tensor_param)
             return
 
+        import time as _time
+        _t0_uw = _time.perf_counter()
+        _ts_uw = lambda tag: print(f"[engine_workers.update_weights] {tag}  wall={_time.perf_counter()-_t0_uw:.3f}s", flush=True)
+        _ts_uw("start")
+
         set_expandable_segments(False)
         # 1. resume weights and update weights
         if self.config.rollout.free_cache_engine:
+            _ts_uw("resume(weights) start")
             await self.rollout.resume(tags=["weights"])
+            _ts_uw("resume(weights) done")
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. get per tensor generator from engine, this will load model to gpu
+        _ts_uw("get_per_tensor_param start")
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True
         )
+        _ts_uw("get_per_tensor_param done  rollout.update_weights start")
 
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        _ts_uw("rollout.update_weights done")
 
         do_lora_base_sync = False
         if not self.peft_merge and peft_config is not None:
@@ -740,18 +751,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.update_weights(per_tensor_base_params, peft_config=peft_config, base_sync_done=False)
 
         log_gpu_memory_usage("After update_weights", logger=logger)
+        _ts_uw("After update_weights log")
 
         # 3. offload model to cpu
+        _ts_uw("actor.engine.to(cpu) start")
         self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
+        _ts_uw("actor.engine.to(cpu) done")
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
+            _ts_uw("resume(kv_cache) start  ← THIS triggers CUDA graph re-capture")
             await self.rollout.resume(tags=["kv_cache"])
+            _ts_uw("resume(kv_cache) done")
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
         set_expandable_segments(True)
+        _ts_uw("update_weights COMPLETE")
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

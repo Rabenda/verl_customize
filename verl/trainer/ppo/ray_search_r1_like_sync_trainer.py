@@ -4,10 +4,13 @@ import json
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
+import ray
 import torch
 import yaml
 from tensordict import TensorDict
@@ -149,6 +152,58 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
         self._tool_parser_cache = None
         self._local_retriever = None
         self._local_retriever_topk = None
+
+    def fit(self):
+        """Dispatch to the correct fit implementation based on ``trainer.fit_method``."""
+        fit_method = self.config.trainer.get("fit_method", "fit")
+        print(f"[SearchR1] fit dispatching → fit_method={fit_method!r}", flush=True)
+        if fit_method in ("fit", "naive", "sequential"):
+            return super().fit()
+        elif fit_method == "fit_overlap_decode":
+            return self.fit_overlap_decode()
+        else:
+            raise ValueError(
+                f"Unknown fit_method='{fit_method}' for SearchR1LikeSyncRayPPOTrainer. "
+                "Valid choices: fit | naive | sequential | fit_overlap_decode"
+            )
+
+    # ── stage-level progress prints (cover both naive and overlap paths) ──
+
+    def _compute_old_log_prob(self, batch):
+        print("[STAGE] old_log_prob: start", flush=True)
+        result = super()._compute_old_log_prob(batch)
+        print("[STAGE] old_log_prob: done", flush=True)
+        return result
+
+    def _compute_ref_log_prob(self, batch):
+        print("[STAGE] ref_log_prob: start", flush=True)
+        result = super()._compute_ref_log_prob(batch)
+        print("[STAGE] ref_log_prob: done", flush=True)
+        return result
+
+    def _compute_values(self, batch):
+        print("[STAGE] compute_values: start", flush=True)
+        result = super()._compute_values(batch)
+        print("[STAGE] compute_values: done", flush=True)
+        return result
+
+    def _update_critic(self, batch):
+        print("[STAGE] update_critic: start", flush=True)
+        result = super()._update_critic(batch)
+        print("[STAGE] update_critic: done", flush=True)
+        return result
+
+    def _update_actor(self, batch):
+        print("[STAGE] update_actor: start", flush=True)
+        result = super()._update_actor(batch)
+        print("[STAGE] update_actor: done", flush=True)
+        return result
+
+    def _compute_or_extract_reward(self, batch, **kwargs):
+        print("[STAGE] compute_reward: start", flush=True)
+        result = super()._compute_or_extract_reward(batch, **kwargs)
+        print("[STAGE] compute_reward: done", flush=True)
+        return result
 
     def _print_longest_response(self, label: str, data: "DataProto", step: int, **kwargs) -> None:
         """No-op: skip printing long responses for Search-R1 sync rollout."""
@@ -323,7 +378,7 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
         if retrieval_method != "bm25" and not retrieval_model_path:
             raise ValueError("Dense local retriever requires `retrieval_model_path` (or `retriever_model`) to be set.")
 
-        from examples.sglang_multiturn.search_r1_like.local_dense_retriever.retrieval_server import Config, get_retriever
+        from examples.sglang_multiturn.search_r1_like.local_dense_retriever.retrieval_server import Config, RetrieverActor
 
         retriever_config = Config(
             retrieval_method=retrieval_method,
@@ -340,7 +395,9 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
             retrieval_batch_size=int(local_cfg.get("retrieval_batch_size", 128)),
             faiss_nprobe=local_cfg.get("faiss_nprobe"),
         )
-        self._local_retriever = get_retriever(retriever_config)
+        # Dense retrieval needs 1 GPU; BM25 needs none.
+        num_gpus = 0 if retrieval_method == "bm25" else 1
+        self._local_retriever = RetrieverActor.options(num_gpus=num_gpus).remote(retriever_config)
         self._local_retriever_topk = retrieval_topk
         return self._local_retriever
 
@@ -356,12 +413,8 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
             out = [json.dumps({"result": "No search queries provided."}, ensure_ascii=False) for _ in query_lists]
             return (out, {"encode_s": 0.0, "faiss_s": 0.0, "load_docs_s": 0.0, "format_s": 0.0}) if return_timing else out
 
-        timing_out = {} if return_timing else None
-        batch_results = retriever.batch_search(
-            flat_queries,
-            num=self._local_retriever_topk,
-            return_score=False,
-            timing_out=timing_out,
+        batch_results, timing_out = ray.get(
+            retriever.batch_search.remote(flat_queries, num=self._local_retriever_topk)
         )
 
         format_t0 = time.perf_counter()
@@ -379,8 +432,8 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
             output_texts.append(json.dumps({"result": tool_text}, ensure_ascii=False))
         format_s = time.perf_counter() - format_t0
 
-        if return_timing and timing_out is not None:
-            timing_out["format_s"] = format_s
+        timing_out["format_s"] = format_s
+        if return_timing:
             return output_texts, timing_out
         return output_texts
 
@@ -698,3 +751,384 @@ class SearchR1LikeSyncRayPPOTrainer(RayPPOTrainer):
             tool_wall=tool_wall,
             source_non_tensor_batch=gen_batch.non_tensor_batch,
         )
+
+    # =========================================================================
+    # Overlap-decode fit: pipeline step-N rollout with step-(N-1) training
+    # =========================================================================
+
+    def fit_overlap_decode(self):
+        """
+        Overlap the multi-turn search rollout of step N with PPO training of step N-1.
+
+        Both phases run on completely different hardware:
+          - Rollout  : sglang inference engine  +  retrieval Ray actor  (inference GPUs)
+          - Training : FSDP actor / critic workers                      (training GPUs)
+
+        Off-policy note
+        ---------------
+        ``update_weights()`` must be called *after* the rollout thread finishes to avoid
+        modifying inference-engine weights mid-generation.  Consequently, the rollout of
+        step N uses the inference-engine weights that were loaded at the *end of step N-2*
+        (1-step off-policy).  This is the same trade-off as ``one_step_off_policy`` and is
+        acceptable for most GRPO / PPO-style search RL training.
+
+        Timeline per step t (t >= 2)
+        -----------------------------
+          [Rollout_t  thread  ────────────────────────────────────────────]
+          [                   Train_{t-1}: reward + logprob + adv + actor ]
+          wait for rollout thread
+          update_weights()   ← safe: inference engine is idle now
+          store gen_out_t as prev batch for next iteration
+        """
+        from omegaconf import OmegaConf
+
+        from verl import DataProto
+        from verl.trainer.ppo.core_algos import agg_loss
+        from verl.trainer.ppo.metric_utils import (
+            compute_data_metrics,
+            compute_timing_metrics,
+            compute_throughout_metrics,
+        )
+        from verl.trainer.ppo.ray_trainer import (
+            apply_kl_penalty,
+            compute_advantage,
+            compute_response_mask,
+        )
+        from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
+        from verl.utils.debug import marked_timer
+        from verl.utils.metric import reduce_metrics
+        from verl.utils.tracking import Tracking
+        from tqdm import tqdm
+
+        _ts = lambda: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        _fmt = lambda v: f"{v:.3f}s" if v is not None else "NA"
+
+        print("\n========== ENTER fit_overlap_decode (Search-R1) ==========", flush=True)
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+        self._load_checkpoint()
+        self.checkpoint_manager.update_weights()
+
+        current_epoch = self.global_steps // len(self.train_dataloader) if len(self.train_dataloader) > 0 else 0
+
+        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        #     val_metrics = self._validate()
+        #     assert val_metrics
+        #     pprint(f"Initial validation metrics: {val_metrics}")
+        #     logger.log(data=val_metrics, step=self.global_steps)
+        #     if self.config.trainer.get("val_only", False):
+        #         print("========== EXIT fit_overlap_decode (val_only) ==========", flush=True)
+        #         return
+
+        progress_bar = tqdm(
+            total=self.total_training_steps, initial=self.global_steps, desc="Search-R1 Overlap Decode"
+        )
+        self.global_steps += 1
+        last_val_metrics = None
+        self.max_steps_duration = 0
+
+        # Batch carried forward from the previous iteration, ready to train.
+        # Contains the full union of (repeated-dataloader-batch  ∪  gen_out) with
+        # response_mask already set.  Training metrics are written into it in-place.
+        prev_full_batch: Optional[DataProto] = None
+
+        # ── helpers ──────────────────────────────────────────────────────────
+
+        def _make_gen_batch(batch_dict: dict) -> tuple[DataProto, DataProto]:
+            """Build raw DataProto and the initial gen_batch_output from a dataloader dict."""
+            b = DataProto.from_single_dict(batch_dict)
+            b.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            b.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(b.batch))], dtype=object
+            )
+            gb = self._get_gen_batch(b)
+            gb.meta_info["global_steps"] = self.global_steps
+            gb_out = gb.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+            return b, gb_out
+
+        def _assemble_full_batch(raw_batch: DataProto, gen_out: DataProto) -> DataProto:
+            """Union repeated raw batch with rollout output and compute auxiliary fields."""
+            fb = raw_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+            fb = fb.union(gen_out)
+            if "response_mask" not in fb.batch:
+                fb.batch["response_mask"] = compute_response_mask(fb)
+            if self.config.trainer.balance_batch:
+                self._balance_batch(fb, metrics={})
+            fb.meta_info["global_token_num"] = torch.sum(fb.batch["attention_mask"], dim=-1).tolist()
+            fb.meta_info["images_seqlens"] = []
+            for mm in fb.non_tensor_batch.get("multi_modal_inputs", []):
+                if "image_grid_thw" in mm:
+                    fb.meta_info["images_seqlens"].extend(mm["images_seqlens"].tolist())
+            return fb
+
+        def _run_train_step(
+            full_batch: DataProto,
+            step_metrics: dict,
+            step_timing: dict,
+        ) -> DataProto:
+            """
+            Execute the full PPO training step (reward → logprob → adv → actor update).
+
+            Does NOT call ``update_weights()`` — the caller does that after the
+            rollout thread has finished so the inference engine is not disturbed.
+            """
+            _t = lambda: time.strftime("%H:%M:%S")
+            print(f"[{_t()}] [OVERLAP/TRAIN] _run_train_step: start", flush=True)
+
+            # ── reward ──────────────────────────────────────────────────────
+            print(f"[{_t()}] [OVERLAP/TRAIN] reward: start", flush=True)
+            with marked_timer("reward", step_timing, color="yellow"):
+                if self.use_rm and "rm_scores" not in full_batch.batch:
+                    if not self.use_reward_loop:
+                        rm_out = self.rm_wg.compute_rm_score(full_batch)
+                    else:
+                        assert self.reward_loop_manager is not None
+                        rm_out = self.reward_loop_manager.compute_rm_score(full_batch)
+                    full_batch = full_batch.union(rm_out)
+                reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
+                    full_batch, reward_fn=self.reward_fn, reward_for_val=False
+                )
+
+            # ── old log-prob ─────────────────────────────────────────────────
+            print(f"[{_t()}] [OVERLAP/TRAIN] old_log_prob: start", flush=True)
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            bypass = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+            if bypass:
+                from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+
+                apply_bypass_mode(
+                    batch=full_batch,
+                    rollout_corr_config=rollout_corr_config,
+                    policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                )
+            else:
+                with marked_timer("old_log_prob", step_timing, color="blue"):
+                    old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(full_batch)
+                    actor_cfg = self.config.actor_rollout_ref.actor
+                    entropy_agg = agg_loss(
+                        loss_mat=old_log_prob.batch["entropys"],
+                        loss_mask=full_batch.batch["response_mask"],
+                        loss_agg_mode=actor_cfg.loss_agg_mode,
+                        loss_scale_factor=actor_cfg.loss_scale_factor,
+                    )
+                    step_metrics["actor/entropy"] = entropy_agg.detach().item()
+                    step_metrics["perf/mfu/actor_infer"] = old_log_prob_mfu
+                    old_log_prob.batch.pop("entropys")
+                    full_batch = full_batch.union(old_log_prob)
+            print(f"[{_t()}] [OVERLAP/TRAIN] old_log_prob: done", flush=True)
+
+            assert "old_log_probs" in full_batch.batch
+
+            # ── reference log-prob ───────────────────────────────────────────
+            if self.use_reference_policy:
+                print(f"[{_t()}] [OVERLAP/TRAIN] ref_log_prob: start", flush=True)
+                with marked_timer("ref_log_prob", step_timing, color="olive"):
+                    ref_log_prob = self._compute_ref_log_prob(full_batch)
+                    full_batch = full_batch.union(ref_log_prob)
+                print(f"[{_t()}] [OVERLAP/TRAIN] ref_log_prob: done", flush=True)
+
+            # ── values (critic) ──────────────────────────────────────────────
+            if self.use_critic:
+                print(f"[{_t()}] [OVERLAP/TRAIN] compute_values: start", flush=True)
+                with marked_timer("values", step_timing, color="cyan"):
+                    values = self._compute_values(full_batch)
+                    full_batch = full_batch.union(values)
+                print(f"[{_t()}] [OVERLAP/TRAIN] compute_values: done", flush=True)
+
+            # ── advantage ────────────────────────────────────────────────────
+            print(f"[{_t()}] [OVERLAP/TRAIN] advantage: start", flush=True)
+            with marked_timer("adv", step_timing, color="brown"):
+                full_batch.batch["token_level_scores"] = reward_tensor
+                if reward_extra_infos_dict:
+                    full_batch.non_tensor_batch.update(
+                        {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                    )
+                if self.config.algorithm.use_kl_in_reward:
+                    full_batch, kl_m = apply_kl_penalty(
+                        full_batch,
+                        kl_ctrl=self.kl_ctrl_in_reward,
+                        kl_penalty=self.config.algorithm.kl_penalty,
+                    )
+                    step_metrics.update(kl_m)
+                else:
+                    full_batch.batch["token_level_rewards"] = full_batch.batch["token_level_scores"]
+
+                full_batch = compute_advantage(
+                    full_batch,
+                    adv_estimator=self.config.algorithm.adv_estimator,
+                    gamma=self.config.algorithm.gamma,
+                    lam=self.config.algorithm.lam,
+                    num_repeat=self.config.actor_rollout_ref.rollout.n,
+                    norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                    config=self.config.algorithm,
+                )
+            print(f"[{_t()}] [OVERLAP/TRAIN] advantage: done", flush=True)
+
+            # ── critic update ────────────────────────────────────────────────
+            if self.use_critic:
+                print(f"[{_t()}] [OVERLAP/TRAIN] update_critic: start", flush=True)
+                with marked_timer("update_critic", step_timing, color="pink"):
+                    critic_out = self._update_critic(full_batch)
+                step_metrics.update(reduce_metrics(critic_out.meta_info["metrics"]))
+                print(f"[{_t()}] [OVERLAP/TRAIN] update_critic: done", flush=True)
+
+            # ── actor update ─────────────────────────────────────────────────
+            if self.config.trainer.critic_warmup <= self.global_steps:
+                print(f"[{_t()}] [OVERLAP/TRAIN] update_actor: start", flush=True)
+                with marked_timer("update_actor", step_timing, color="red"):
+                    actor_out = self._update_actor(full_batch)
+                step_metrics.update(reduce_metrics(actor_out.meta_info["metrics"]))
+                print(f"[{_t()}] [OVERLAP/TRAIN] update_actor: done", flush=True)
+
+            print(f"[{_t()}] [OVERLAP/TRAIN] _run_train_step: done", flush=True)
+            return full_batch
+
+        # ── main training loop ────────────────────────────────────────────────
+
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                print(f"[{_ts()}] [OVERLAP_DECODE] epoch={epoch} step={self.global_steps}", flush=True)
+                metrics: dict = {}
+                timing_raw: dict = {}
+                is_last_step = self.global_steps >= self.total_training_steps
+
+                with marked_timer("step", timing_raw):
+                    raw_batch, gen_batch_output = _make_gen_batch(batch_dict)
+
+                    # ── Phase 1: launch current-step rollout in background ──
+                    t_rollout_start = time.perf_counter()
+                    with ThreadPoolExecutor(max_workers=1) as ex:
+                        rollout_fut = ex.submit(self._generate_rollout_batch, gen_batch_output)
+
+                        # ── Phase 2: train previous step while rollout runs ──
+                        train_wall = 0.0
+                        if prev_full_batch is not None:
+                            print(
+                                f"[{_ts()}] [OVERLAP_DECODE] training prev step (step {self.global_steps - 1})"
+                                " while rolling out current step",
+                                flush=True,
+                            )
+                            t_train_start = time.perf_counter()
+                            prev_full_batch = _run_train_step(prev_full_batch, metrics, timing_raw)
+                            train_wall = time.perf_counter() - t_train_start
+                            print(
+                                f"[{_ts()}] [OVERLAP_DECODE] prev training done: {_fmt(train_wall)}",
+                                flush=True,
+                            )
+
+                        # ── Phase 3: wait for rollout ──
+                        t_wait_start = time.perf_counter()
+                        gen_batch_output = rollout_fut.result()
+                        wait_wall = time.perf_counter() - t_wait_start
+
+                    rollout_wall = time.perf_counter() - t_rollout_start
+                    print(
+                        f"[{_ts()}] [OVERLAP_DECODE] rollout done: {_fmt(rollout_wall)}"
+                        f" (waited {_fmt(wait_wall)} for thread)",
+                        flush=True,
+                    )
+
+                    # ── Phase 4: update_weights after rollout thread exits ──
+                    # Must come AFTER rollout to avoid modifying inference-engine
+                    # weights while generation is in flight.
+                    if prev_full_batch is not None:
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights()
+
+                    # Checkpoint saving (only when a training step was executed)
+                    if prev_full_batch is not None and self.config.trainer.critic_warmup <= self.global_steps:
+                        esi_close = should_save_ckpt_esi(
+                            max_steps_duration=self.max_steps_duration,
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                        )
+                        if self.config.trainer.save_freq > 0 and (
+                            (self.global_steps - 1) % self.config.trainer.save_freq == 0 or esi_close
+                        ):
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
+
+                    # Rollout timing from gen_batch_output meta_info
+                    timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
+                    gen_batch_output.meta_info.pop("timing", None)
+
+                    # Overlap stats
+                    overlap_time = min(rollout_wall, train_wall) if train_wall > 0 else 0.0
+                    timing_raw["puzzrl_rollout"] = rollout_wall
+                    timing_raw["train_overlap_wall"] = train_wall
+                    timing_raw["overlap"] = overlap_time
+                    timing_raw["rollout_wait_wall"] = wait_wall
+                    print(
+                        f"[{_ts()}] [OVERLAP_DECODE] "
+                        f"rollout={_fmt(rollout_wall)} train={_fmt(train_wall)} "
+                        f"overlap={_fmt(overlap_time)} wait={_fmt(wait_wall)}",
+                        flush=True,
+                    )
+
+                    # Assemble full batch for NEXT iteration's training.
+                    # This is intentionally deferred so the next rollout can start
+                    # immediately without waiting for assembly.
+                    cur_full_batch = _assemble_full_batch(raw_batch, gen_batch_output)
+                    prev_full_batch = cur_full_batch
+
+                # ── validation ───────────────────────────────────────────────
+                if (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.test_freq > 0
+                    and (self.global_steps % self.config.trainer.test_freq == 0)
+                ):
+                    with marked_timer("testing", timing_raw, color="green"):
+                        val_metrics = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
+
+                # ── metrics & logging ────────────────────────────────────────
+                steps_duration = timing_raw.get("step", 0.0)
+                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                metrics.update({"training/global_step": self.global_steps, "training/epoch": epoch})
+                # Use cur_full_batch for data metrics (current rollout's structural stats).
+                # Training quality metrics (reward, actor loss, etc.) are already in `metrics`
+                # from _run_train_step and correspond to the previous step's data — this is
+                # expected behaviour in a 1-step-off-policy pipeline.
+                metrics.update(compute_data_metrics(batch=cur_full_batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(batch=cur_full_batch, timing_raw=timing_raw))
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(
+                    compute_throughout_metrics(batch=cur_full_batch, timing_raw=timing_raw, n_gpus=n_gpus)
+                )
+
+                if getattr(self, "profiler", None) is not None:
+                    self.profiler.update(timing_raw=timing_raw, step=self.global_steps)
+
+                logger.log(data=metrics, step=self.global_steps)
+                progress_bar.update(1)
+                self.global_steps += 1
+
+                if is_last_step:
+                    break
+
+        # ── final step: train the last batch with no rollout to overlap ──────
+        if prev_full_batch is not None:
+            print(
+                f"[{_ts()}] [OVERLAP_DECODE] training final batch (step {self.global_steps}, no overlap)",
+                flush=True,
+            )
+            final_metrics: dict = {}
+            final_timing: dict = {}
+            prev_full_batch = _run_train_step(prev_full_batch, final_metrics, final_timing)
+            self.checkpoint_manager.update_weights()
+            if self.config.trainer.save_freq > 0:
+                self._save_checkpoint()
+            logger.log(data=final_metrics, step=self.global_steps)
+
+        pprint(f"Final validation metrics: {last_val_metrics}")
+        progress_bar.close()
+        print("========== EXIT fit_overlap_decode (Search-R1) ==========", flush=True)

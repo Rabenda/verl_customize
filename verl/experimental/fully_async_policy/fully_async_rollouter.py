@@ -640,11 +640,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             await asyncio.gather(self.processor_task, return_exceptions=True)
 
-        # Send a finish signal
+        # Send a finish signal and shutdown the queue so trainer's get_sample unblocks
         await self.message_queue_client.put_sample(
             sample=None,
             param_version=self.current_param_version,
         )
+        await self.message_queue_client.shutdown()
 
         async with self.lock:
             self.running = False

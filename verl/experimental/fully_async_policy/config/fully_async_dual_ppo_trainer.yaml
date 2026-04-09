@@ -1,0 +1,138 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ── Dual model config ──────────────────────────────────────────────────────
+# actor_rollout_ref_a / actor_rollout_ref_b override actor_rollout_ref per model.
+# The base actor_rollout_ref is still required by some helpers; set it to model A.
+actor_rollout_ref_a:
+  model:
+    path: ???          # path to model A checkpoint
+
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 256
+    ppo_max_token_len_per_gpu: 16384
+    loss_agg_mode: token-mean
+    loss_scale_factor: 1.0
+    optim:
+      lr: 1e-6
+
+  rollout:
+    name: sglang
+    mode: async
+    n: 4
+    temperature: 1.0
+    top_p: 0.99
+    max_new_tokens: 2048
+    calculate_log_probs: True
+    multi_turn:
+      enable: False
+
+  hybrid_engine: False
+
+actor_rollout_ref_b:
+  model:
+    path: ???          # path to model B checkpoint
+
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 256
+    ppo_max_token_len_per_gpu: 16384
+    loss_agg_mode: token-mean
+    loss_scale_factor: 1.0
+    optim:
+      lr: 1e-6
+
+  rollout:
+    name: sglang
+    mode: async
+    n: 4
+    temperature: 1.0
+    top_p: 0.99
+    max_new_tokens: 2048
+    calculate_log_probs: True
+    multi_turn:
+      enable: False
+
+  hybrid_engine: False
+
+# ── Async training knobs ───────────────────────────────────────────────────
+async_training:
+  staleness_threshold: 0.1
+  trigger_parameter_sync_step: 4
+  require_batches: 1
+  partial_rollout: True
+  use_rollout_log_probs: True
+  compute_prox_log_prob: False
+  use_trainer_do_validate: False
+  parallel_validate_and_rollout: False
+
+  checkpoint_engine:
+    enable: True
+    device_buffer_size_M: 4096
+    overlap_broadcast_and_consume: False
+
+# ── GPU-R pool (hosts sglang-A + FSDP-B) ──────────────────────────────────
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 8
+  n: 4
+  total_rollout_steps: null   # derived from data if null
+  total_epochs: 1
+  test_freq: 5
+
+# ── GPU-T pool (hosts sglang-B + FSDP-A) ──────────────────────────────────
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 8
+  total_epochs: 1
+  total_training_steps: null
+  save_freq: 10
+  test_freq: 5
+  val_before_train: True
+  balance_batch: False
+  critic_warmup: 0
+  esi_redundant_time: 300
+  del_local_ckpt_after_load: False
+
+# ── Data ───────────────────────────────────────────────────────────────────
+data:
+  train_files: ???
+  val_files: ???
+  train_batch_size: 0        # unused in fully-async mode
+  gen_batch_size: 1          # stream one prompt at a time
+  val_batch_size: null
+  max_prompt_length: 512
+  max_response_length: 2048
+  trust_remote_code: False
+  dataloader_num_workers: 2
+  validation_shuffle: True
+
+# ── Algorithm ──────────────────────────────────────────────────────────────
+algorithm:
+  adv_estimator: grpo
+  gamma: 1.0
+  lam: 1.0
+  use_kl_in_reward: False
+  kl_penalty: kl
+  norm_adv_by_std_in_grpo: True
+
+# ── Reward model ───────────────────────────────────────────────────────────
+reward_model:
+  enable: False
+  launch_reward_fn_async: False
+  use_reward_loop: False
+
+# ── Critic (disabled in dual async mode) ───────────────────────────────────
+critic:
+  strategy: fsdp2
+
+# ── Global profiler (pass-through) ─────────────────────────────────────────
+global_profiler:
+  steps: null
+  tool: null

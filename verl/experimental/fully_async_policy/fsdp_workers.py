@@ -86,11 +86,18 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
 
                     inference_model = self._run_async_safely(init_engine())
                     if inference_model is None:
-                        raise RuntimeError(
-                            f"Failed to initialize rollout engine. "
-                            f"rollout type: {type(self.rollout)}, "
-                            f"has _init_server_adapter: {hasattr(self.rollout, '_init_server_adapter')}"
+                        # Non-rank-0 tp workers intentionally have no engine; only raise on rank 0
+                        is_tp_rank0 = not (
+                            hasattr(self, "rollout_device_mesh")
+                            and self.rollout_device_mesh is not None
+                            and self.rollout_device_mesh["infer_tp"].get_local_rank() != 0
                         )
+                        if is_tp_rank0:
+                            raise RuntimeError(
+                                f"Failed to initialize rollout engine. "
+                                f"rollout type: {type(self.rollout)}, "
+                                f"has _init_server_adapter: {hasattr(self.rollout, '_init_server_adapter')}"
+                            )
             else:
                 raise NotImplementedError(f"Unknown rollout name: {rollout_name}")
 
