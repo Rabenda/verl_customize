@@ -121,7 +121,7 @@ for staleness_case in "${STALENESS_CASES[@]}"; do
     \
     async_training.staleness_threshold=${STALENESS_THRESHOLD} \
     async_training.trigger_parameter_sync_step=${TRIGGER_SYNC_STEP} \
-    async_training.require_batches=2 \
+    async_training.require_batches=4 \
     async_training.partial_rollout=${PARTIAL_ROLLOUT} \
     async_training.use_rollout_log_probs=True \
     async_training.use_trainer_do_validate=False \

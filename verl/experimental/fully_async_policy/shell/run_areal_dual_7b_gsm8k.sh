@@ -19,7 +19,7 @@ TRAIN_FILE="/data/${DATASET}/train.parquet"
 VAL_FILE="/data/${DATASET}/test.parquet"
 
 # staleness 三档：sync / light_async / one_step_off
-STALENESS_CASES=(sync light_async one_step_off)
+STALENESS_CASES=(one_step_off)
 
 MODEL_SHORT="${MODEL//\//_}"
 LOG_DIR=areal_dual_log
