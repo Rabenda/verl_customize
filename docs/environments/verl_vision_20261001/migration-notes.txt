@@ -1,0 +1,42 @@
+verl_vision 环境导出（2026-10-01）
+
+这是当前机器的安装记录，不是已验证的可运行配置。
+Python: 3.12.13; PyTorch: 2.9.1+cu128; torchvision: 0.24.1+cu128
+SGLang 安装记录: 0.5.8; sgl-kernel: 0.3.21; flash-attn: 2.8.3
+transformers: 4.57.1; ray: 2.55.1; tensordict: 0.10.0
+
+文件说明:
+pip-freeze-original.txt: 完整原始 pip 清单，含失效的本机 editable 路径。
+environment-original.yml: 原始 Conda/Pip 导出，已去掉 prefix，仍含失效路径。
+conda-explicit-linux-64.txt: 原始 Conda 精确清单，仅 Conda 包，不含 pip 包。
+environment-base.yml: 仅 Conda 基础环境，不含 pip 业务依赖。
+requirements-portable.txt: 移除了本机 editable 路径和 flash-attn，增加 PyTorch cu128 索引；其余保留安装版本，包括已有冲突。
+
+检查结果:
+1. verl 的 editable 安装指向 /workspace/repo/verl_vision，目录已不存在。
+2. sglang 的 editable 安装指向 /workspace/repo/sglang_vision_profile/python，目录已不存在。
+3. pip check: torch 2.9.1+cu128 要求 nvidia-cudnn-cu12==9.10.2.21，但当前安装 9.16.0.29。
+   安装前需要在 requirements-portable.txt 中将该项改成 9.10.2.21，或自行验证并选择其他兼容的完整组合。
+4. verl_customize/setup.py 的 SGLang extra 指定 0.5.6，而 requirements_sglang.txt 指定 0.5.2，均不同于此环境的 0.5.8。
+   不要直接叠加安装这些不同配置。此导出并不证明 0.5.8 与 verl_customize 兼容。
+5. nvidia-smi 在此会话报 NVML 初始化错误，未能获取 GPU 型号及驱动版本。
+
+在目标 Linux x86_64 机器上的安装顺序参考（尚未在目标机验证）:
+conda env create -f environment-base.yml
+conda activate verl_vision
+# 先按上面的说明修正 cuDNN 版本，再安装清单
+python -m pip install -r requirements-portable.txt
+# flash-attn 单独安装；可能需要对应 CUDA Toolkit、编译器或匹配的预编译 wheel
+python -m pip install flash-attn==2.8.3 --no-build-isolation
+# 复制并确认本地 SGLang 源码版本后，安装你的 SGLang 源码
+python -m pip install --no-deps -e /目标路径/sglang/python
+# 复制当前 verl_customize 代码（包括未提交修改），安装它
+python -m pip install --no-deps -e /目标路径/verl_customize
+python -m pip check
+python -c "import torch, verl, sglang; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(verl.__file__, sglang.__file__)"
+
+verl_customize 路径: /workspace/repo/verl_sglang/verl_customize
+Git HEAD: ee17d75f50d095ef8e3babef6892cce1e167f618
+该仓库有未提交修改和未跟踪文件；只 clone 此 commit 不等于当前目录内容。
+归档 SGLang 目录存在 /workspace/repo/_archive_sglang_vision_profile/python，未确认它与失效的安装记录相同。
+完整环境包含额外工具包，未对最小训练依赖集合做裁剪，也未执行 GPU/训练验证。
